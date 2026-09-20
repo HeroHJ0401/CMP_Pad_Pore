@@ -1,0 +1,5 @@
+numpy>=1.26,<3
+scipy>=1.11
+scikit-image>=0.22
+Pillow>=10.0
+tkinterdnd2>=0.4.3

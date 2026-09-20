@@ -1,0 +1,118 @@
+name: Build executables
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:        # Actions 탭에서 수동 실행
+
+permissions:
+  contents: write           # 태그 푸시 시 Release 생성에 필요
+
+jobs:
+  # ---------------------------------------------------------------- test
+  smoke-test:
+    name: Algorithm smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy scipy scikit-image Pillow
+      - name: Run pipeline on a synthetic image
+        run: python tests/smoke_test.py
+
+  # --------------------------------------------------------------- build
+  build:
+    name: Build ${{ matrix.label }}
+    needs: smoke-test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows (.exe)
+            artifact: CMP_PoreAnalyzer-windows
+            upload_path: dist/CMP_PoreAnalyzer.exe
+            release_path: dist/CMP_PoreAnalyzer.exe
+          - os: macos-14            # Apple Silicon (arm64)
+            label: macOS arm64 (.app)
+            artifact: CMP_PoreAnalyzer-macos-arm64
+            upload_path: dist/CMP_PoreAnalyzer-macos-arm64.zip
+            release_path: dist/CMP_PoreAnalyzer-macos-arm64.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build
+        shell: bash
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name CMP_PoreAnalyzer
+          --osx-bundle-identifier com.cmp.poreanalyzer
+          --collect-all skimage
+          --collect-all tkinterdnd2
+          --hidden-import PIL._tkinter_finder
+          --exclude-module matplotlib
+          --exclude-module pytest
+          --exclude-module IPython
+          main.py
+
+      - name: Verify the build runs (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python tests/make_sample.py sample.png
+          ./dist/CMP_PoreAnalyzer.exe --cli sample.png --csv out.csv
+          test -f out.csv || { echo "CLI run produced no CSV"; exit 1; }
+          head -2 out.csv
+
+      - name: Verify the build runs (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          python tests/make_sample.py sample.png
+          ./dist/CMP_PoreAnalyzer.app/Contents/MacOS/CMP_PoreAnalyzer --cli sample.png --csv out.csv
+          test -f out.csv || { echo "CLI run produced no CSV"; exit 1; }
+          head -2 out.csv
+
+      - name: Package .app bundle (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        # -y keeps the symlinks inside the bundle intact; a plain artifact
+        # upload would otherwise strip them and the executable bit.
+        run: |
+          cd dist
+          zip -qry CMP_PoreAnalyzer-macos-arm64.zip CMP_PoreAnalyzer.app
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.upload_path }}
+          retention-days: 90
+
+      - name: Attach to release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.release_path }}
+          generate_release_notes: true

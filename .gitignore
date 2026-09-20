@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.spec
+*.csv
+sample*.png
+*_overlay.png
+.DS_Store
+.idea/
+.vscode/
