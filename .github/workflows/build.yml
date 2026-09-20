@@ -14,6 +14,7 @@ jobs:
   smoke-test:
     name: Algorithm smoke test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,6 +33,9 @@ jobs:
     name: Build ${{ matrix.label }}
     needs: smoke-test
     runs-on: ${{ matrix.os }}
+    # A windowed build that pops an error dialog would otherwise hang the
+    # runner until the 6-hour default limit.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -76,22 +80,39 @@ jobs:
           --exclude-module IPython
           main.py
 
+      # `timeout` matters: a windowed build that hits an unhandled error pops a
+      # modal dialog nobody can dismiss on a runner, and the step would hang
+      # until the job limit. Kill it and judge the run by the CSV it produced.
       - name: Verify the build runs (Windows)
         if: runner.os == 'Windows'
+        timeout-minutes: 5
         shell: bash
         run: |
+          set -x
           python tests/make_sample.py sample.png
-          ./dist/CMP_PoreAnalyzer.exe --cli sample.png --csv out.csv
-          test -f out.csv || { echo "CLI run produced no CSV"; exit 1; }
+
+          # First unfrozen, to tell "the code is broken" apart from
+          # "freezing it broke it". This one must succeed outright.
+          python main.py --cli sample.png --csv src.csv
+          test -f src.csv || { echo "FAIL: source run produced no CSV"; exit 1; }
+
+          timeout 120 ./dist/CMP_PoreAnalyzer.exe --cli sample.png --csv out.csv > exe.log 2>&1
+          code=$?
+          echo "exe exit code: $code  (124 = killed after 120 s, i.e. it hung)"
+          echo "--- exe output ---"; cat exe.log || true; echo "--- end ---"
+          test -f out.csv || { echo "FAIL: frozen exe produced no CSV"; exit 1; }
           head -2 out.csv
 
       - name: Verify the build runs (macOS)
         if: runner.os == 'macOS'
+        timeout-minutes: 5
         shell: bash
         run: |
           python tests/make_sample.py sample.png
-          ./dist/CMP_PoreAnalyzer.app/Contents/MacOS/CMP_PoreAnalyzer --cli sample.png --csv out.csv
-          test -f out.csv || { echo "CLI run produced no CSV"; exit 1; }
+          timeout 120 ./dist/CMP_PoreAnalyzer.app/Contents/MacOS/CMP_PoreAnalyzer \
+            --cli sample.png --csv out.csv \
+            || echo "app exited non-zero or was killed after 120 s"
+          test -f out.csv || { echo "FAIL: CLI run produced no CSV"; exit 1; }
           head -2 out.csv
 
       - name: Package .app bundle (macOS)
