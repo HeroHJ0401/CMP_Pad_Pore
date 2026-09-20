@@ -83,36 +83,47 @@ jobs:
       # `timeout` matters: a windowed build that hits an unhandled error pops a
       # modal dialog nobody can dismiss on a runner, and the step would hang
       # until the job limit. Kill it and judge the run by the CSV it produced.
-      - name: Verify the build runs (Windows)
-        if: runner.os == 'Windows'
-        timeout-minutes: 5
+      # run_timeout.py rather than the `timeout` command: macOS does not ship
+      # one. It never fails the step itself, so the log always shows what the
+      # program actually printed; the CSV check below is what decides.
+      - name: Verify the build runs
+        timeout-minutes: 6
         shell: bash
-        run: |
-          set -x
-          python tests/make_sample.py sample.png
-
-          # First unfrozen, to tell "the code is broken" apart from
-          # "freezing it broke it". This one must succeed outright.
-          python main.py --cli sample.png --csv src.csv
-          test -f src.csv || { echo "FAIL: source run produced no CSV"; exit 1; }
-
-          timeout 120 ./dist/CMP_PoreAnalyzer.exe --cli sample.png --csv out.csv > exe.log 2>&1
-          code=$?
-          echo "exe exit code: $code  (124 = killed after 120 s, i.e. it hung)"
-          echo "--- exe output ---"; cat exe.log || true; echo "--- end ---"
-          test -f out.csv || { echo "FAIL: frozen exe produced no CSV"; exit 1; }
-          head -2 out.csv
-
-      - name: Verify the build runs (macOS)
-        if: runner.os == 'macOS'
-        timeout-minutes: 5
-        shell: bash
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
         run: |
           python tests/make_sample.py sample.png
-          timeout 120 ./dist/CMP_PoreAnalyzer.app/Contents/MacOS/CMP_PoreAnalyzer \
-            --cli sample.png --csv out.csv \
-            || echo "app exited non-zero or was killed after 120 s"
-          test -f out.csv || { echo "FAIL: CLI run produced no CSV"; exit 1; }
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            APP=./dist/CMP_PoreAnalyzer.exe
+          else
+            APP=./dist/CMP_PoreAnalyzer.app/Contents/MacOS/CMP_PoreAnalyzer
+          fi
+          echo "app under test: $APP"
+          ls -l "$APP" || { echo "FAIL: the build produced no executable"; exit 1; }
+
+          echo "=================== unfrozen (python main.py) ==================="
+          python tests/run_timeout.py 120 python main.py --cli sample.png --csv src.csv
+
+          echo "=================== frozen (packaged app) ======================"
+          python tests/run_timeout.py 120 "$APP" --cli sample.png --csv out.csv
+
+          echo "=================== verdict ===================================="
+          src_ok=0; out_ok=0
+          [ -f src.csv ] && src_ok=1
+          [ -f out.csv ] && out_ok=1
+          echo "source run wrote a CSV : $src_ok"
+          echo "packaged run wrote CSV : $out_ok"
+
+          if [ "$src_ok" = "0" ]; then
+            echo "FAIL: the code itself does not run on this OS — see the unfrozen output above."
+            exit 1
+          fi
+          if [ "$out_ok" = "0" ]; then
+            echo "FAIL: the code runs but the packaged app does not — a packaging problem."
+            exit 1
+          fi
           head -2 out.csv
 
       - name: Package .app bundle (macOS)

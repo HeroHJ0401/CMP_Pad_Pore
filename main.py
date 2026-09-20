@@ -51,6 +51,24 @@ def _ensure_console_io():
         except OSError:
             pass
 
+    # This program prints Korean. A Windows console defaults to a legacy code
+    # page (cp949 / cp1252) that cannot encode it, and the resulting
+    # UnicodeEncodeError would abort a batch run — or, in a windowed build,
+    # surface as a modal error dialog. Never let an output encoding kill the
+    # analysis: the numbers are already in the CSV.
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            try:
+                reconfigure(errors="replace")
+            except Exception:
+                pass
+
 
 def main():
     multiprocessing.freeze_support()   # required for PyInstaller onefile builds
