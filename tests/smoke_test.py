@@ -9,7 +9,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
-from pore_analyzer.core import Params, analyze_array, robustness_sweep
+from pore_analyzer.core import Params, analyze_array, robustness_sweep, detect_bands
 from tests.make_sample import make
 
 
@@ -37,6 +37,21 @@ def main():
     # the sweep must produce the full grid without error
     rows = robustness_sweep(gray, p)
     checks.append(("sweep grid complete", len(rows) == 21))
+
+    # Band detection: a letterboxed copy must measure the same as the original
+    # once the bands are trimmed, and a clean image must not be trimmed at all.
+    W = gray.shape[1]
+    boxed = np.vstack([np.zeros((150, W)), gray, np.zeros((70, W))])
+    top, bot = detect_bands(boxed)
+    checks.append(("no band on a clean image", detect_bands(gray) == (0, 0)))
+    checks.append(("letterbox found", (top, bot) == (150, 70)))
+    trimmed = boxed[top: boxed.shape[0] - bot, :]
+    res_trim = analyze_array(trimmed, p, source="trimmed")
+    checks.append(("trimmed == original",
+                   abs(res_trim.open_pore_fraction - res.open_pore_fraction) < 1e-9))
+    res_boxed = analyze_array(boxed, p, source="boxed")
+    checks.append(("untrimmed letterbox understates",
+                   res_boxed.open_pore_fraction < res.open_pore_fraction))
 
     ok = True
     for name, passed in checks:

@@ -24,7 +24,8 @@ from scipy import ndimage as ndi
 from skimage import measure, morphology, filters
 from PIL import Image
 
-__all__ = ["Params", "Result", "analyze_path", "analyze_array", "robustness_sweep"]
+__all__ = ["Params", "Result", "analyze_path", "analyze_array",
+           "robustness_sweep", "detect_bands", "load_gray"]
 
 
 # --------------------------------------------------------------------------
@@ -43,6 +44,7 @@ class Params:
     solidity_cut: float = 0.90        # convex-opening criterion
     exclude_border: bool = True       # drop frame-touching objects
     crop_bottom_px: int = 0           # crop SEM info bar (rows removed from bottom)
+    crop_top_px: int = 0              # crop letterboxing (rows removed from top)
     normalize: str = "fixed"          # "fixed" (v/255) | "minmax" | "otsu"
 
     def copy_with(self, **kw) -> "Params":
@@ -127,8 +129,8 @@ def _r(x, n):
 # Image loading
 # --------------------------------------------------------------------------
 
-def load_gray(path: str, crop_bottom_px: int = 0) -> np.ndarray:
-    """Load an image as float grayscale in [0, 1]."""
+def load_gray(path: str, crop_bottom_px: int = 0, crop_top_px: int = 0) -> np.ndarray:
+    """Load an image as float grayscale in [0, 1], optionally trimming bands."""
     img = Image.open(path)
     if img.mode not in ("L", "I;16", "I"):
         img = img.convert("L")
@@ -139,30 +141,40 @@ def load_gray(path: str, crop_bottom_px: int = 0) -> np.ndarray:
         arr = arr / 65535.0
     else:
         arr = arr / 255.0
-    if crop_bottom_px > 0 and crop_bottom_px < arr.shape[0]:
-        arr = arr[: arr.shape[0] - crop_bottom_px, :]
+
+    h = arr.shape[0]
+    top = max(0, int(crop_top_px))
+    bot = max(0, int(crop_bottom_px))
+    if top + bot < h:
+        arr = arr[top: h - bot if bot else h, :]
     return np.clip(arr, 0.0, 1.0)
 
 
-def detect_info_bar(gray: np.ndarray) -> int:
+def _scan_band(gray: np.ndarray, from_bottom: bool) -> int:
     """
-    Detect a solid SEM data/annotation bar at the bottom of the frame.
+    Count rows belonging to a solid band at one edge of the frame.
 
     Deliberately conservative: a false positive silently removes real image
-    area from the denominator, which is worse than missing a bar the user can
-    crop manually. A row only counts as banner if it is essentially flat
+    area from the denominator, which is worse than missing a band the user can
+    crop manually. A row only counts as band if it is essentially flat
     (std < 0.01) AND close to pure black or pure white, and the whole run must
     be at least 1.5 % of the image height while staying under one third of it.
-    Returns the number of rows to remove from the bottom, or 0.
     """
     h = gray.shape[0]
     row_std = gray.std(axis=1)
     row_mean = gray.mean(axis=1)
-    body_mean = float(np.median(row_mean[: max(1, h // 2)]))
+    limit = h // 3
+
+    # index of the k-th row inward from the chosen edge
+    def idx(k):
+        return h - 1 - k if from_bottom else k
+
+    body = row_mean[h // 4: 3 * h // 4]
+    body_mean = float(np.median(body)) if body.size else float(np.median(row_mean))
 
     n = 0
-    limit = h // 3
-    for i in range(h - 1, h - 1 - limit, -1):
+    while n < limit:
+        i = idx(n)
         flat = row_std[i] < 0.01
         extreme = (row_mean[i] < 0.12) or (row_mean[i] > 0.88)
         if flat and extreme:
@@ -173,22 +185,44 @@ def detect_info_bar(gray: np.ndarray) -> int:
     if n < max(6, int(h * 0.015)):
         return 0
 
-    # Extend upward through annotation rows inside the same band: a row of
+    band_rows = [idx(k) for k in range(n)]
+    dark_band = float(np.mean(row_mean[band_rows])) < 0.5
+
+    # Extend inward through annotation rows inside the same band: a row of
     # white text on a black bar is not flat, but almost every pixel in it is
     # still at one extreme of the range.
-    dark_bar = float(np.mean(row_mean[h - n:])) < 0.5
-    for i in range(h - 1 - n, h - 1 - limit, -1):
-        row = gray[i]
-        frac = float(np.mean(row < 0.12) if dark_bar else np.mean(row > 0.88))
+    while n < limit:
+        row = gray[idx(n)]
+        frac = float(np.mean(row < 0.12) if dark_band else np.mean(row > 0.88))
         if frac >= 0.75:
             n += 1
         else:
             break
 
-    # the band must also be clearly different from the image body
-    if abs(float(np.mean(row_mean[h - n:])) - body_mean) < 0.15:
+    band_rows = [idx(k) for k in range(n)]
+    if abs(float(np.mean(row_mean[band_rows])) - body_mean) < 0.15:
         return 0
     return n
+
+
+def detect_bands(gray: np.ndarray) -> tuple:
+    """
+    Detect solid bands at the top and bottom of the frame and return
+    (top_rows, bottom_rows). Covers both the SEM data bar, which sits at the
+    bottom, and the black letterboxing a screen capture adds at both edges.
+    Either value is 0 when no band is found. The two runs never overlap.
+    """
+    h = gray.shape[0]
+    bottom = _scan_band(gray, from_bottom=True)
+    top = _scan_band(gray, from_bottom=False)
+    if top + bottom >= h:               # degenerate (near-uniform image)
+        return 0, 0
+    return top, bottom
+
+
+def detect_info_bar(gray: np.ndarray) -> int:
+    """Bottom band only. Kept for callers that predate detect_bands()."""
+    return detect_bands(gray)[1]
 
 
 # --------------------------------------------------------------------------
@@ -332,7 +366,7 @@ def _make_overlay(gray: np.ndarray, lbl: np.ndarray, kept: list, p: Params) -> n
 
 def analyze_path(path: str, p: Params) -> Result:
     """Load an image file and analyze it."""
-    gray = load_gray(path, crop_bottom_px=p.crop_bottom_px)
+    gray = load_gray(path, crop_bottom_px=p.crop_bottom_px, crop_top_px=p.crop_top_px)
     import os
     return analyze_array(gray, p, source=os.path.basename(path))
 

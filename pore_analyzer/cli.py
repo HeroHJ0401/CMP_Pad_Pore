@@ -10,7 +10,7 @@ import sys
 
 from PIL import Image
 
-from .core import Params, analyze_path, load_gray, robustness_sweep, detect_info_bar
+from .core import Params, analyze_path, load_gray, robustness_sweep, detect_bands
 
 
 def build_parser():
@@ -25,7 +25,8 @@ def build_parser():
     ap.add_argument("--solidity", type=float, default=0.90, help="Solidity 기준 (기본 0.90)")
     ap.add_argument("--opening-radius", type=int, default=2, help="Opening 반경 px (기본 2)")
     ap.add_argument("--crop-bottom", type=int, default=0, help="하단 크롭 px (기본 0, 0이면 자동 감지)")
-    ap.add_argument("--no-autocrop", action="store_true", help="SEM 정보바 자동 크롭 비활성화")
+    ap.add_argument("--crop-top", type=int, default=0, help="상단 크롭 px (기본 0, 0이면 자동 감지)")
+    ap.add_argument("--no-autocrop", action="store_true", help="위·아래 단색 띠 자동 크롭 비활성화")
     ap.add_argument("--keep-border", action="store_true", help="프레임 접촉 객체를 제외하지 않음")
     ap.add_argument("--csv", metavar="PATH", help="결과를 CSV로 저장")
     ap.add_argument("--overlay-dir", metavar="DIR", help="오버레이 PNG를 저장할 디렉터리")
@@ -61,17 +62,18 @@ def main(argv=None):
         solidity_cut=args.solidity,
         opening_radius_px=args.opening_radius,
         crop_bottom_px=args.crop_bottom,
+        crop_top_px=args.crop_top,
         exclude_border=not args.keep_border,
     )
 
     rows = []
     for path in files:
         p = base
-        if not args.no_autocrop and base.crop_bottom_px == 0:
-            n = detect_info_bar(load_gray(path, 0))
-            if n:
-                p = base.copy_with(crop_bottom_px=n)
-                print(f"  (정보바 {n} px 자동 크롭)")
+        if not args.no_autocrop and base.crop_bottom_px == 0 and base.crop_top_px == 0:
+            top, bot = detect_bands(load_gray(path))
+            if top or bot:
+                p = base.copy_with(crop_top_px=top, crop_bottom_px=bot)
+                print(f"  (단색 띠 자동 크롭: 위 {top} px, 아래 {bot} px)")
         res = analyze_path(path, p)
         rows.append(res.summary_row())
 
@@ -97,7 +99,7 @@ def main(argv=None):
 
         if args.sweep:
             print("  --- 강건성 스윕 (임계 x solidity -> 개공률 %) ---")
-            for r in robustness_sweep(load_gray(path, p.crop_bottom_px), p):
+            for r in robustness_sweep(load_gray(path, p.crop_bottom_px, p.crop_top_px), p):
                 print(f"    thr={r['threshold']:.2f}  S={r['solidity_cut']:.2f}  "
                       f"{r['open_pore_fraction_pct']:6.2f} %   n={r['n_objects']}")
 
