@@ -25,7 +25,8 @@ from skimage import measure, morphology, filters
 from PIL import Image
 
 __all__ = ["Params", "Result", "analyze_path", "analyze_array",
-           "robustness_sweep", "detect_bands", "load_gray"]
+           "robustness_sweep", "detect_bands", "load_gray",
+           "prepare", "pooled_otsu"]
 
 
 # --------------------------------------------------------------------------
@@ -45,7 +46,17 @@ class Params:
     exclude_border: bool = True       # drop frame-touching objects
     crop_bottom_px: int = 0           # crop SEM info bar (rows removed from bottom)
     crop_top_px: int = 0              # crop letterboxing (rows removed from top)
-    normalize: str = "fixed"          # "fixed" (v/255) | "minmax" | "otsu"
+
+    # How the dark/bright decision is made. These two are independent:
+    #   normalize_contrast  rescales each image onto its own intensity span,
+    #                       cancelling gain/offset differences between images.
+    #   threshold_mode      "fixed"      -> use `threshold` as given
+    #                       "otsu"       -> pick it per image
+    #                       "otsu_batch" -> pick ONE from all images together
+    normalize_contrast: bool = False
+    threshold_mode: str = "fixed"
+    norm_low_pct: float = 1.0         # percentile mapped to 0 when normalizing
+    norm_high_pct: float = 99.0       # percentile mapped to 1 when normalizing
 
     def copy_with(self, **kw) -> "Params":
         d = asdict(self)
@@ -83,7 +94,8 @@ class Result:
     concave_ratio: float = float("nan")   # fraction of objects with solidity < cut
     mean_convex_deficiency: float = float("nan")
 
-    otsu_threshold: float = float("nan")  # reference only
+    otsu_threshold: float = float("nan")    # this image's own Otsu value
+    effective_threshold: float = float("nan")  # what was actually applied
 
     # heavy payloads (not written to CSV)
     objects: list = field(default_factory=list, repr=False)
@@ -112,6 +124,7 @@ class Result:
             "n_rejected_small": self.n_rejected_small,
             "n_rejected_border": self.n_rejected_border,
             "border_area_fraction_pct": round(100 * self.border_area_fraction, 2),
+            "effective_threshold": _r(self.effective_threshold, 4),
             "otsu_threshold_ref": _r(self.otsu_threshold, 3),
         }
 
@@ -229,8 +242,50 @@ def detect_info_bar(gray: np.ndarray) -> int:
 # Core analysis
 # --------------------------------------------------------------------------
 
-def analyze_array(gray: np.ndarray, p: Params, source: str = "") -> Result:
-    """Run the full pipeline on a float grayscale image in [0, 1]."""
+def prepare(gray: np.ndarray, p: Params) -> np.ndarray:
+    """Normalize (optionally) and smooth — everything before the threshold."""
+    g = gray
+    if p.normalize_contrast:
+        lo, hi = np.percentile(g, [p.norm_low_pct, p.norm_high_pct])
+        if hi > lo:
+            g = np.clip((g - lo) / (hi - lo), 0.0, 1.0)
+    return ndi.gaussian_filter(g, sigma=p.sigma_px) if p.sigma_px > 0 else g
+
+
+def pooled_otsu(grays, p: Params, max_px_per_image: int = 400_000) -> float:
+    """
+    One Otsu threshold computed from several images at once.
+
+    Per-image Otsu cancels brightness differences but also moves with the real
+    thing being measured: an image with genuinely more open pore area gets a
+    different threshold, so part of the difference under test is absorbed. A
+    threshold pooled over the images being compared adapts to the set's actual
+    greyscale range while staying identical for every image in it.
+    """
+    samples = []
+    rng = np.random.default_rng(0)
+    for g in grays:
+        sm = prepare(g, p).ravel()
+        if sm.size > max_px_per_image:            # subsample big images
+            sm = rng.choice(sm, max_px_per_image, replace=False)
+        samples.append(sm)
+    if not samples:
+        return float("nan")
+    pool = np.concatenate(samples)
+    try:
+        return float(filters.threshold_otsu(pool))
+    except Exception:
+        return float("nan")
+
+
+def analyze_array(gray: np.ndarray, p: Params, source: str = "",
+                  forced_threshold: Optional[float] = None) -> Result:
+    """
+    Run the full pipeline on a float grayscale image in [0, 1].
+
+    `forced_threshold` overrides the threshold that `p` would choose; it is how
+    a batch-wide Otsu value is pushed into each image's analysis.
+    """
     res = Result(source=source)
     h, w = gray.shape
     res.height_px, res.width_px = h, w
@@ -238,15 +293,8 @@ def analyze_array(gray: np.ndarray, p: Params, source: str = "") -> Result:
     res.field_h_um = h * p.pixel_size_um
     res.field_area_um2 = res.field_w_um * res.field_h_um
 
-    # ---- normalization -------------------------------------------------
-    g = gray
-    if p.normalize == "minmax":
-        lo, hi = np.percentile(g, [0.5, 99.5])
-        if hi > lo:
-            g = np.clip((g - lo) / (hi - lo), 0.0, 1.0)
-
-    # ---- smoothing -----------------------------------------------------
-    sm = ndi.gaussian_filter(g, sigma=p.sigma_px) if p.sigma_px > 0 else g
+    # ---- normalize + smooth --------------------------------------------
+    sm = prepare(gray, p)
 
     # ---- threshold -----------------------------------------------------
     try:
@@ -254,7 +302,16 @@ def analyze_array(gray: np.ndarray, p: Params, source: str = "") -> Result:
     except Exception:
         res.otsu_threshold = float("nan")
 
-    thr = res.otsu_threshold if p.normalize == "otsu" else p.threshold
+    if forced_threshold is not None:
+        thr = float(forced_threshold)
+    elif p.threshold_mode == "otsu":
+        thr = res.otsu_threshold
+    else:                                  # "fixed", and "otsu_batch" without
+        thr = p.threshold                  # a pooled value supplied
+    if not np.isfinite(thr):
+        thr = p.threshold
+    res.effective_threshold = float(thr)
+
     binary = sm < thr                     # dark = candidate opening
     res.dark_area_fraction = float(binary.mean())
 
@@ -385,7 +442,8 @@ def robustness_sweep(gray: np.ndarray, p: Params,
     """
     rows = []
     for t in thresholds:
-        pt = p.copy_with(threshold=t)
+        # the sweep is about the threshold VALUE, so pin the mode to fixed
+        pt = p.copy_with(threshold=t, threshold_mode="fixed")
         r = analyze_array(gray, pt)
         for s in solidities:
             area = sum(o["area_um2"] for o in r.objects

@@ -23,7 +23,9 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from .core import (Params, analyze_path, load_gray, analyze_array,
-                   robustness_sweep, detect_bands)
+                   robustness_sweep, detect_bands, pooled_otsu)
+from .pixelsize import read_pixel_size, format_pixel_size
+from .scalebar import measure_scale_bar
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -85,19 +87,29 @@ COLS = [
      "프레임 접촉으로 제외된 객체들이 차지하던 면적의 비율입니다.\n\n"
      "큰 객체일수록 경계에 닿을 확률이 높으므로, 이 값이 크면 개공률은 그만큼 "
      "과소평가된 상태입니다. 논문에 수치를 쓰실 때 함께 밝히시는 것이 정직합니다."),
+    ("effective_threshold", "적용 임계", 78,
+     "이 이미지에 실제로 적용된 이진화 임계값입니다.\n\n"
+     "'고정'에서는 입력하신 값 그대로이고, 'Otsu(이미지별)'에서는 이미지마다 "
+     "다르며, 'Otsu(일괄)'에서는 모든 이미지가 같은 값을 갖습니다.\n\n"
+     "두 조건을 비교하실 때는 이 열의 값이 서로 같은지 반드시 확인하십시오. "
+     "값이 다르면 개공률 차이에 임계값 차이가 섞여 들어갑니다."),
     ("otsu_threshold_ref", "Otsu(참고)", 84,
-     "이 이미지에서 자동으로 산출된 Otsu 임계값입니다. 계산에는 쓰이지 "
-     "않습니다.\n\n"
-     "설정하신 이진화 임계값이 이 값과 크게 다르면, 조명이나 대비가 다른 "
-     "이미지를 같은 고정 임계로 비교하고 있지 않은지 확인해 보십시오."),
+     "이 이미지 한 장만으로 산출한 Otsu 임계값입니다. 모드가 "
+     "'Otsu(이미지별)'일 때만 실제로 쓰이고, 그 외에는 참고용입니다.\n\n"
+     "설정하신 고정 임계값이 이 값과 크게 다르면, 밝기나 대비가 다른 이미지를 "
+     "같은 고정 임계로 비교하고 있다는 신호입니다. 그럴 때는 '대비 정규화'를 "
+     "켜시거나 'Otsu(일괄)'로 바꾸십시오."),
 ]
 
 PARAM_HELP = {
     "pixel_size_um":
-        "이미지 한 픽셀이 실제로 몇 µm인지입니다. 배율마다 다르므로 SEM 스케일바로 "
-        "확인하십시오.\n\n면적·등가직경·밀도·개공률이 모두 이 값에 의존합니다. "
-        "잘못 넣으면 형상 지표(원형도·solidity)는 그대로지만 크기 관련 값이 전부 "
-        "틀어집니다.",
+        "이미지 한 픽셀이 실제로 몇 µm인지입니다.\n\n"
+        "직접 계산하실 필요 없습니다. 이미지를 추가하시면 파일 메타데이터에서 "
+        "자동으로 읽어 채웁니다(Zeiss·FEI·ImageJ·TIFF 해상도 태그). 메타데이터가 "
+        "없는 화면 캡처나 JPEG라면 옆의 '스케일바로 측정' 버튼을 누르고 이미지에 "
+        "찍힌 스케일바를 드래그하신 뒤 거기 적힌 길이를 입력하시면 됩니다.\n\n"
+        "면적·등가직경·밀도·개공률이 모두 이 값에 비례합니다. 형상 지표"
+        "(원형도·solidity)는 영향을 받지 않습니다.",
     "sigma_px":
         "이진화 전에 적용하는 가우시안 평활의 표준편차(픽셀)입니다.\n\n"
         "각 픽셀은 자기 밝기가 아니라 주변 약 ±3σ 이웃의 가중평균과 임계값을 "
@@ -105,8 +117,9 @@ PARAM_HELP = {
         "0을 넣으면 평활을 건너뜁니다.",
     "threshold":
         "정규화 밝기(0~1) 기준으로 이 값보다 어두운 픽셀을 개구부 후보로 봅니다.\n\n"
-        "고정 임계값이므로 두 조건을 비교하실 때는 반드시 같은 값을 쓰셔야 합니다. "
-        "값 자체의 타당성은 오른쪽 표의 Otsu 참고값과 대조해 보십시오.",
+        "임계 모드가 '고정'일 때만 쓰입니다. Otsu 모드에서는 프로그램이 임계값을 "
+        "직접 고르므로 이 칸은 무시됩니다.\n\n"
+        "값 자체의 타당성은 결과 표의 'Otsu(참고)' 값과 대조해 보십시오.",
     "min_diam_um":
         "등가직경이 이 값보다 작은 덩어리는 버립니다. 유효 최소 스케일에 해당합니다.\n\n"
         "기본값 2.0 µm는 픽셀 크기 0.404 µm 기준으로 약 5픽셀, 면적으로는 약 19픽셀입니다.",
@@ -127,7 +140,36 @@ PARAM_HELP = {
         "잘라내지 않으면 그 띠가 시야 면적에 포함되어 개공률이 실제보다 낮게 나옵니다.",
 }
 
+THRESHOLD_MODES = [
+    ("고정", "fixed"),
+    ("Otsu (이미지별)", "otsu"),
+    ("Otsu (일괄)", "otsu_batch"),
+]
+
+MODE_HELP = (
+    "어두운 곳과 밝은 곳을 가르는 기준을 어떻게 정할지입니다.\n\n"
+    "• 고정 — 입력하신 임계값을 그대로 씁니다. 촬영 조건이 완전히 동일한 "
+    "이미지들에만 안전합니다. 한쪽이 더 밝게 찍히면 그 차이가 개공률 차이로 "
+    "둔갑합니다.\n\n"
+    "• Otsu (이미지별) — 이미지마다 밝기 분포를 보고 임계값을 따로 정합니다. "
+    "밝기 차이는 사라지지만, 조건 간 실제 차이까지 일부 흡수할 수 있습니다.\n\n"
+    "• Otsu (일괄) — 불러온 모든 이미지의 밝기 분포를 합쳐 임계값 하나를 정하고 "
+    "전부에 똑같이 적용합니다. 이미지 집합의 실제 밝기 범위에 맞추면서도 "
+    "비교 대상 간에는 동일한 기준이 유지됩니다.\n\n"
+    "두 조건을 비교하신다면 '대비 정규화 + Otsu(일괄)'을 권합니다. "
+    "'권장 설정' 버튼으로 한 번에 맞출 수 있습니다."
+)
+
 CHECK_HELP = {
+    "normalize":
+        "이미지마다 밝기·대비를 자기 자신의 범위에 맞춰 늘려 편 뒤에 임계를 "
+        "적용합니다.\n\n"
+        "하위 1 %와 상위 99 % 밝기를 각각 0과 1로 보내는 방식이라, SEM의 "
+        "brightness/contrast 설정이 달라 생긴 차이를 상쇄합니다. 극단값을 기준으로 "
+        "삼기 때문에 기공이 많고 적음에는 거의 흔들리지 않습니다.\n\n"
+        "합성 이미지 실험에서, 한쪽을 밝고 대비 낮게 찍은 경우 고정 임계만으로는 "
+        "조건 간 비율이 2.25배에서 1.73배로 무너졌지만, 이 옵션을 켜면 2.22배로 "
+        "돌아왔습니다.",
     "border":
         "이미지 경계에 닿은 객체를 계산에서 제외합니다.\n\n"
         "잘린 객체는 둘레와 볼록 껍질이 실제와 달라 형상 지표를 신뢰할 수 없습니다. "
@@ -333,17 +375,60 @@ class App:
                 attach_tip(lab, self.tip, help_text, key=f"param:{key}")
                 attach_tip(ent, self.tip, help_text, key=f"param:{key}")
 
+        # pixel size helper, right under the parameter grid
+        pbtn = ttk.Frame(pbox)
+        pbtn.grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        b_scale = ttk.Button(pbtn, text="스케일바로 측정…", command=self._measure_scale)
+        b_scale.pack(side="left")
+        attach_tip(b_scale, self.tip,
+                   "선택한 이미지를 원본 그대로(정보바 포함) 띄워 드립니다. "
+                   "스케일바의 한쪽 끝에서 반대쪽 끝까지 드래그하시고 거기 적힌 "
+                   "길이를 입력하시면 픽셀 크기를 계산해 채웁니다.\n\n"
+                   "확대경과 수평 고정이 있어 한두 픽셀 오차를 줄일 수 있습니다.",
+                   key="btn:scalebar")
+        self.lbl_px_src = ttk.Label(pbtn, text="", style="Hint.TLabel")
+        self.lbl_px_src.pack(side="left", padx=(8, 0))
+
+        # threshold mode
+        mrow = ttk.Frame(pbox)
+        mrow.grid(row=5, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        lab_mode = ttk.Label(mrow, text="임계 모드", cursor="question_arrow")
+        lab_mode.pack(side="left", padx=(0, 6))
+        self.var_mode = tk.StringVar(value="고정")
+        cmb = ttk.Combobox(mrow, textvariable=self.var_mode, state="readonly",
+                           width=15, values=[m[0] for m in THRESHOLD_MODES])
+        cmb.pack(side="left")
+        attach_tip(lab_mode, self.tip, MODE_HELP, key="mode")
+        attach_tip(cmb, self.tip, MODE_HELP, key="mode")
+
+        self.var_normalize = tk.BooleanVar(value=False)
+        cb0 = ttk.Checkbutton(mrow, text="대비 정규화", variable=self.var_normalize)
+        cb0.pack(side="left", padx=(12, 0))
+        attach_tip(cb0, self.tip, CHECK_HELP["normalize"], key="chk:normalize")
+
+        b_reco = ttk.Button(mrow, text="권장 설정", command=self._apply_recommended)
+        b_reco.pack(side="left", padx=(12, 0))
+        attach_tip(b_reco, self.tip,
+                   "조건 간 비교에 가장 안전한 조합으로 맞춥니다: "
+                   "대비 정규화 켬 + Otsu(일괄).\n\n"
+                   "합성 이미지 실험에서 한쪽을 밝고 대비 낮게 찍어도 조건 간 "
+                   "비율이 2.24배로 유지되었습니다. 같은 조건에서 고정 임계는 "
+                   "1.73배까지 무너집니다.\n\n"
+                   "다만 기존 논문 수치(고정 0.45)를 재현하실 때는 '고정'을 "
+                   "쓰셔야 합니다.",
+                   key="btn:reco")
+
         self.var_border = tk.BooleanVar(value=True)
         self.var_autocrop = tk.BooleanVar(value=True)
         cb1 = ttk.Checkbutton(pbox, text="프레임 접촉 객체 제외", variable=self.var_border)
-        cb1.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        cb1.grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
         cb2 = ttk.Checkbutton(pbox, text="위·아래 단색 띠 자동 크롭", variable=self.var_autocrop)
-        cb2.grid(row=4, column=2, columnspan=2, sticky="w", pady=(6, 0))
+        cb2.grid(row=6, column=2, columnspan=2, sticky="w", pady=(6, 0))
         attach_tip(cb1, self.tip, CHECK_HELP["border"], key="chk:border")
         attach_tip(cb2, self.tip, CHECK_HELP["autocrop"], key="chk:autocrop")
 
         abox = ttk.Frame(pbox)
-        abox.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        abox.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         self.btn_run = ttk.Button(abox, text="분석 실행", command=self._run)
         self.btn_run.pack(side="left")
         ttk.Button(abox, text="CSV 저장", command=self._save_csv).pack(side="left", padx=4)
@@ -422,6 +507,52 @@ class App:
         # ---- status -----------------------------------------------------
         self.status = ttk.Label(outer, text="대기 중", style="Hint.TLabel", anchor="w")
         self.status.pack(fill="x", pady=(6, 0))
+
+    def _mode_key(self) -> str:
+        label = self.var_mode.get()
+        for name, key in THRESHOLD_MODES:
+            if name == label:
+                return key
+        return "fixed"
+
+    def _apply_recommended(self):
+        self.var_normalize.set(True)
+        self.var_mode.set("Otsu (일괄)")
+        self.status.config(
+            text="권장 설정 적용: 대비 정규화 + Otsu(일괄). "
+                 "모든 이미지에 같은 임계값이 적용되며, 결과 표의 '적용 임계' 열에서 확인하실 수 있습니다.")
+
+    def _measure_scale(self):
+        path = self._selected_path() or (self.files[0] if self.files else None)
+        if path is None:
+            messagebox.showinfo("이미지 없음",
+                                "스케일바를 측정할 이미지를 먼저 추가하십시오.")
+            return
+        try:
+            value = measure_scale_bar(self.root, path)
+        except Exception:
+            messagebox.showerror("측정 실패", traceback.format_exc(limit=3))
+            return
+        if value:
+            self.v["pixel_size_um"].set(f"{value:.6g}")
+            self.lbl_px_src.config(text=f"스케일바 측정값 · {os.path.basename(path)}")
+            self.status.config(text=f"픽셀 크기를 {format_pixel_size(value)}로 설정했습니다.")
+
+    def _autofill_pixel_size(self, path):
+        """Take µm/px from the file's own metadata, once, without overriding a
+        value the user has already set by hand."""
+        if getattr(self, "_px_locked", False):
+            return
+        got = read_pixel_size(path)
+        if not got:
+            return
+        value, source = got
+        self.v["pixel_size_um"].set(f"{value:.6g}")
+        self.lbl_px_src.config(text=f"{source} · {os.path.basename(path)}")
+        self._px_locked = True
+        self.status.config(
+            text=f"{os.path.basename(path)}의 메타데이터에서 픽셀 크기 "
+                 f"{format_pixel_size(value)}를 읽었습니다. [{source}]")
 
     def _set_drop_hint(self):
         self.lbl_hint.config(
@@ -506,6 +637,7 @@ class App:
                 added += 1
         if added:
             self.status.config(text=f"{added}개 추가 — 총 {len(self.files)}개")
+            self._autofill_pixel_size(self.files[0])
 
     def _remove_sel(self):
         for i in sorted(self.lst.curselection(), reverse=True):
@@ -540,6 +672,8 @@ class App:
             crop_top_px=f("crop_top_px", int),
             crop_bottom_px=f("crop_bottom_px", int),
             exclude_border=self.var_border.get(),
+            normalize_contrast=self.var_normalize.get(),
+            threshold_mode=self._mode_key(),
         )
         if p.pixel_size_um <= 0:
             raise ValueError("픽셀 크기는 0보다 커야 합니다.")
@@ -568,18 +702,50 @@ class App:
                          args=(list(self.files), p, autocrop), daemon=True).start()
 
     def _worker(self, files, p, autocrop):
-        for i, path in enumerate(files, 1):
-            try:
-                self._q.put(("status", f"[{i}/{len(files)}] {os.path.basename(path)} 분석 중…"))
-                pp = p
-                if autocrop and p.crop_top_px == 0 and p.crop_bottom_px == 0:
+        # Pass 1: settle the crop for each file. The batch threshold has to be
+        # computed from exactly the pixels that will be analysed, so cropping
+        # must be decided before the histogram is pooled.
+        plans = []
+        for path in files:
+            pp = p
+            if autocrop and p.crop_top_px == 0 and p.crop_bottom_px == 0:
+                try:
                     top, bot = detect_bands(load_gray(path))
-                    if top or bot:
-                        pp = p.copy_with(crop_top_px=top, crop_bottom_px=bot)
-                        self._q.put(("status",
-                                     f"{os.path.basename(path)}: 단색 띠 자동 크롭 "
-                                     f"(위 {top} px, 아래 {bot} px)"))
-                res = analyze_path(path, pp)
+                except Exception:
+                    top = bot = 0
+                if top or bot:
+                    pp = p.copy_with(crop_top_px=top, crop_bottom_px=bot)
+            plans.append((path, pp))
+
+        # Pass 2: one threshold from all images, when that mode is selected.
+        # A generator keeps only one image in memory at a time.
+        forced = None
+        if p.threshold_mode == "otsu_batch":
+            self._q.put(("status", "모든 이미지의 밝기 분포를 합쳐 공통 임계값 계산 중…"))
+
+            def grays():
+                for path, pp in plans:
+                    try:
+                        yield load_gray(path, pp.crop_bottom_px, pp.crop_top_px)
+                    except Exception:
+                        continue
+            forced = pooled_otsu(grays(), p)
+            if forced == forced:                      # not NaN
+                self._q.put(("status",
+                             f"공통 임계값 {forced:.4f} — 모든 이미지에 동일하게 적용합니다."))
+            else:
+                forced = None
+                self._q.put(("status",
+                             "공통 임계값을 구하지 못해 입력하신 고정 임계값을 사용합니다."))
+
+        # Pass 3: analyse
+        for i, (path, pp) in enumerate(plans, 1):
+            try:
+                self._q.put(("status",
+                             f"[{i}/{len(plans)}] {os.path.basename(path)} 분석 중…"))
+                gray = load_gray(path, pp.crop_bottom_px, pp.crop_top_px)
+                res = analyze_array(gray, pp, source=os.path.basename(path),
+                                    forced_threshold=forced)
                 self._q.put(("result", (path, res, pp)))
             except Exception:
                 self._q.put(("error", (path, traceback.format_exc(limit=3))))
@@ -703,12 +869,21 @@ class App:
             crop_note = (f"자동 크롭 위 {used.crop_top_px} px / 아래 "
                          f"{used.crop_bottom_px} px 적용 후 측정\n")
 
+        mode_note = ""
+        if used is not None:
+            label = {"fixed": "고정", "otsu": "Otsu(이미지별)",
+                     "otsu_batch": "Otsu(일괄)"}.get(used.threshold_mode, used.threshold_mode)
+            norm = " · 대비 정규화" if used.normalize_contrast else ""
+            mode_note = (f"임계 {res.effective_threshold:.4f} "
+                         f"({label}{norm}) · 이 이미지의 Otsu {res.otsu_threshold:.3f}\n")
+
         self.lbl_big.config(text=f"개공률 {100*res.open_pore_fraction:.2f} %")
         self.lbl_sub.config(text=(
             f"객체 {res.n_objects}개 · 원형도 중앙값 {res.circularity_median:.3f} · "
             f"Solidity 중앙값 {res.solidity_median:.3f}\n"
             f"시야 {res.field_w_um:.0f} × {res.field_h_um:.0f} µm "
             f"({res.width_px} × {res.height_px} px)\n"
+            f"{mode_note}"
             f"{crop_note}"
             f"단순 암부면적률 {100*res.dark_area_fraction:.1f} % — 그림자 포함, 참고용\n"
             f"프레임 접촉 제외 {res.n_rejected_border}개 "

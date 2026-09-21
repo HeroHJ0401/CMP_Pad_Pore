@@ -9,7 +9,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
-from pore_analyzer.core import Params, analyze_array, robustness_sweep, detect_bands
+from pore_analyzer.core import (Params, analyze_array, robustness_sweep,
+                                detect_bands, pooled_otsu)
+from pore_analyzer.pixelsize import from_scale_bar
 from tests.make_sample import make
 
 
@@ -52,6 +54,52 @@ def main():
     res_boxed = analyze_array(boxed, p, source="boxed")
     checks.append(("untrimmed letterbox understates",
                    res_boxed.open_pore_fraction < res.open_pore_fraction))
+
+    # ---- thresholding must survive a brightness/contrast difference -------
+    # Two conditions that genuinely differ, where the more porous one was also
+    # imaged brighter and flatter. The measured ratio must track the true one.
+    lo = make(n_round=110, seed=3).astype(float) / 255.0
+    hi = make(n_round=300, seed=4).astype(float) / 255.0
+    hi_bright = np.clip(hi * 0.75 + 0.22, 0, 1)
+
+    def ratio(a, b, **kw):
+        q = Params(**kw)
+        if q.threshold_mode == "otsu_batch":
+            t = pooled_otsu([a, b], q)
+            ra = analyze_array(a, q, forced_threshold=t)
+            rb = analyze_array(b, q, forced_threshold=t)
+        else:
+            ra, rb = analyze_array(a, q), analyze_array(b, q)
+        return rb.open_pore_fraction / ra.open_pore_fraction, ra, rb
+
+    truth, _, _ = ratio(lo, hi, threshold_mode="fixed")
+    fixed_shifted, _, _ = ratio(lo, hi_bright, threshold_mode="fixed")
+    reco, ra, rb = ratio(lo, hi_bright, threshold_mode="otsu_batch",
+                         normalize_contrast=True)
+
+    checks.append(("fixed threshold is distorted by brightness",
+                   abs(fixed_shifted - truth) / truth > 0.15))
+    checks.append(("normalize + batch Otsu recovers the true ratio",
+                   abs(reco - truth) / truth < 0.05))
+    checks.append(("batch Otsu applies one threshold to every image",
+                   abs(ra.effective_threshold - rb.effective_threshold) < 1e-12))
+    checks.append(("effective threshold is recorded",
+                   np.isfinite(ra.effective_threshold)))
+
+    # ---- scale bar arithmetic --------------------------------------------
+    checks.append(("scale bar µm/px", abs(from_scale_bar(250, 100, "µm") - 0.4) < 1e-12))
+    checks.append(("scale bar unit conversion",
+                   abs(from_scale_bar(250, 100000, "nm") - 0.4) < 1e-9))
+    bad = 0
+    for args in ((0, 100, "µm"), (250, 0, "µm"), (250, 100, "furlong")):
+        try:
+            from_scale_bar(*args)
+        except ValueError:
+            bad += 1
+    checks.append(("scale bar rejects bad input", bad == 3))
+
+    print(f"\ntrue ratio {truth:.2f} | fixed under brightness shift "
+          f"{fixed_shifted:.2f} | normalize+batch Otsu {reco:.2f}")
 
     ok = True
     for name, passed in checks:
