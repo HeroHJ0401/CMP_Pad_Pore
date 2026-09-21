@@ -22,9 +22,9 @@ from tkinter import ttk, filedialog, messagebox
 import numpy as np
 from PIL import Image, ImageTk
 
-from .core import (Params, analyze_path, load_gray, analyze_array,
-                   robustness_sweep, detect_bands, pooled_otsu)
-from .pixelsize import read_pixel_size, format_pixel_size
+from .core import (Params, load_gray, analyze_array, robustness_sweep,
+                   detect_bands, pooled_otsu, unique_labels)
+from .pixelsize import read_pixel_size, format_pixel_size, ScaleStore
 from .scalebar import measure_scale_bar
 
 try:
@@ -38,11 +38,18 @@ IMAGE_EXT = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 CONVEX = "#2ecc71"      # solidity >= cut  -> counted in the open-pore fraction
 CONCAVE = "#e74c3c"     # solidity <  cut  -> excluded
 PANEL_W = 460           # preview panel width; also the label wrap width
+APP_NAME = "CMP Pad 개공율 분석기_정현진"
 
 # key, heading, width, tooltip
 COLS = [
-    ("file", "파일", 170,
+    ("file", "파일", 160,
      "분석한 이미지 파일명입니다."),
+    ("pixel_size_um", "µm/px", 70,
+     "이 이미지에 적용된 픽셀 크기입니다. 이미지마다 다를 수 있습니다.\n\n"
+     "개공률은 분자와 분모가 모두 픽셀 크기의 제곱으로 스케일되므로 이 값에 "
+     "거의 영향을 받지 않습니다. 영향을 받는 것은 등가직경·밀도·시야, 그리고 "
+     "최소 등가직경(µm) 필터를 통과하는 객체의 범위입니다.\n\n"
+     "원형도와 solidity는 무차원이라 전혀 영향이 없습니다."),
     ("n_objects", "객체수", 62,
      "모든 필터를 통과해 형상 지표 계산에 사용된 어두운 영역의 개수입니다.\n\n"
      "제외되는 것: 등가직경이 최소값 미만인 객체, 이미지 경계에 닿은 객체."),
@@ -161,6 +168,16 @@ MODE_HELP = (
 )
 
 CHECK_HELP = {
+    "phys":
+        "평활 σ와 opening 반경을 픽셀이 아니라 µm로 지정합니다.\n\n"
+        "배율이 다른 이미지를 함께 분석하실 때 필요합니다. σ = 1.2 px는 "
+        "0.404 µm/px에서 0.485 µm이지만 0.101 µm/px에서는 0.121 µm라, "
+        "같은 숫자가 전혀 다른 물리적 크기가 됩니다.\n\n"
+        "켜시면 입력하신 µm 값을 이미지마다 자기 픽셀 크기로 나누어 픽셀 수를 "
+        "구하므로, 배율이 달라도 평활과 opening이 같은 물리적 거리를 덮습니다. "
+        "즉 필터가 모든 이미지에서 같은 의미를 갖습니다.\n\n"
+        "이것이 보장하는 것은 기준의 일관성이지, 개공률이 반드시 더 가까워진다는 "
+        "뜻은 아닙니다. 실제 차이는 표면과 배율에 따라 달라집니다.",
     "normalize":
         "이미지마다 밝기·대비를 자기 자신의 범위에 맞춰 늘려 편 뒤에 임계를 "
         "적용합니다.\n\n"
@@ -245,6 +262,22 @@ class Tooltip:
         self._win = win
 
 
+PREVIEW_MAX = 1000      # longest side kept in memory for the overlay preview
+
+
+def _shrink_overlay(overlay, max_side=PREVIEW_MAX):
+    """Downscale an overlay to preview size; the original is not kept."""
+    if overlay is None:
+        return None
+    h, w = overlay.shape[:2]
+    if max(h, w) <= max_side:
+        return overlay
+    scale = max_side / float(max(h, w))
+    im = Image.fromarray(overlay).resize(
+        (max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+    return np.asarray(im)
+
+
 def attach_tip(widget, tooltip: Tooltip, text, key=None):
     """Static tooltip for one widget."""
     key = key or (str(widget), text[:24])
@@ -267,12 +300,16 @@ def attach_tip(widget, tooltip: Tooltip, text, key=None):
 class App:
     def __init__(self, root, initial_files=None):
         self.root = root
-        root.title("CMP Pad 개공률 분석기")
+        root.title(APP_NAME)
         root.geometry("1320x840")
         root.minsize(1100, 700)
 
         self.files: list[str] = []
         self.results: dict[str, object] = {}
+        # path -> (um_per_px or None, where it came from)
+        self.px_info: dict[str, tuple] = {}
+        self.scale_store = ScaleStore()
+        self._failures: list = []
         self._preview_img = None
         self._q: queue.Queue = queue.Queue()
         self._busy = False
@@ -311,6 +348,7 @@ class App:
         s.configure("Hint.TLabel", foreground="#666")
         s.configure("Big.TLabel", font=("Segoe UI", 15, "bold"))
         s.configure("Legend.TLabel", font=("Segoe UI", 9))
+        s.configure("Warn.TLabel", foreground="#b8860b", font=("Segoe UI", 9))
 
     def _build_widgets(self):
         outer = ttk.Frame(self.root, padding=8)
@@ -323,19 +361,40 @@ class App:
         fbox = ttk.LabelFrame(top, text="이미지", padding=6)
         fbox.pack(side="left", fill="both", expand=True)
 
-        self.lst = tk.Listbox(fbox, height=6, activestyle="dotbox",
-                              selectmode="extended", exportselection=False)
-        self.lst.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(fbox, orient="vertical", command=self.lst.yview)
+        # A table rather than a plain list: every image carries its own scale,
+        # because a batch may mix magnifications.
+        fholder = tk.Frame(fbox, width=420, height=132)
+        fholder.pack_propagate(False)
+        fholder.pack(side="left", fill="both", expand=True)
+        self.flist = ttk.Treeview(fholder, columns=("name", "px", "src"),
+                                  show="headings", height=6, selectmode="extended")
+        self.flist.heading("name", text="파일")
+        self.flist.heading("px", text="µm/px")
+        self.flist.heading("src", text="출처")
+        self.flist.column("name", width=190, anchor="w", stretch=True)
+        self.flist.column("px", width=78, anchor="center", stretch=False)
+        self.flist.column("src", width=120, anchor="w", stretch=False)
+        self.flist.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(fholder, orient="vertical", command=self.flist.yview)
         sb.pack(side="left", fill="y")
-        self.lst.config(yscrollcommand=sb.set)
-        self.lst.bind("<<ListboxSelect>>", lambda e: self._show_preview())
+        self.flist.config(yscrollcommand=sb.set)
+        self.flist.bind("<<TreeviewSelect>>", lambda e: self._show_preview())
+        self.flist.bind("<Double-1>", self._edit_pixel_size)
+        self.flist.tag_configure("unknown", foreground="#b8860b")
 
         fbtn = ttk.Frame(fbox)
         fbtn.pack(side="left", fill="y", padx=(8, 0))
         ttk.Button(fbtn, text="이미지 추가", command=self._browse).pack(fill="x", pady=2)
         ttk.Button(fbtn, text="선택 제거", command=self._remove_sel).pack(fill="x", pady=2)
         ttk.Button(fbtn, text="전체 비우기", command=self._clear).pack(fill="x", pady=2)
+        b_px = ttk.Button(fbtn, text="픽셀 크기 지정…", command=self._edit_pixel_size)
+        b_px.pack(fill="x", pady=(8, 2))
+        attach_tip(b_px, self.tip,
+                   "선택한 이미지의 픽셀 크기를 직접 입력하거나 스케일바로 "
+                   "측정합니다. 표의 행을 더블클릭하셔도 같습니다.\n\n"
+                   "배율이 서로 다른 이미지를 함께 분석하실 수 있습니다. "
+                   "이미지마다 자기 값을 갖습니다.",
+                   key="btn:pxedit")
         self.lbl_hint = ttk.Label(fbtn, text="", style="Hint.TLabel", wraplength=130)
         self.lbl_hint.pack(fill="x", pady=(6, 0))
 
@@ -364,9 +423,11 @@ class App:
             ("상단 크롭 (px)", "crop_top_px"),
             ("하단 크롭 (px)", "crop_bottom_px"),
         ]
+        self.param_labels = {}
         for i, (label, key) in enumerate(rows):
             r, c = i % 4, i // 4
             lab = ttk.Label(pbox, text=label, cursor="question_arrow")
+            self.param_labels[key] = lab
             lab.grid(row=r, column=c * 2, sticky="w", padx=(0, 6), pady=2)
             ent = ttk.Entry(pbox, textvariable=self.v[key], width=8)
             ent.grid(row=r, column=c * 2 + 1, pady=2)
@@ -406,6 +467,12 @@ class App:
         cb0.pack(side="left", padx=(12, 0))
         attach_tip(cb0, self.tip, CHECK_HELP["normalize"], key="chk:normalize")
 
+        self.var_phys = tk.BooleanVar(value=False)
+        cb3 = ttk.Checkbutton(mrow, text="σ·opening을 µm로",
+                              variable=self.var_phys, command=self._update_unit_labels)
+        cb3.pack(side="left", padx=(12, 0))
+        attach_tip(cb3, self.tip, CHECK_HELP["phys"], key="chk:phys")
+
         b_reco = ttk.Button(mrow, text="권장 설정", command=self._apply_recommended)
         b_reco.pack(side="left", padx=(12, 0))
         attach_tip(b_reco, self.tip,
@@ -443,6 +510,10 @@ class App:
                    key="btn:sweep")
 
         # ---- table + preview -------------------------------------------
+        self.lbl_mixed = ttk.Label(outer, text="", style="Warn.TLabel",
+                                   anchor="w", justify="left", wraplength=1250)
+        self.lbl_mixed.pack(fill="x", pady=(6, 0))
+
         mid = ttk.Frame(outer)
         mid.pack(fill="both", expand=True, pady=(8, 0))
         # grid, not pack: a Treeview with 12 columns requests ~1000 px and
@@ -508,6 +579,26 @@ class App:
         self.status = ttk.Label(outer, text="대기 중", style="Hint.TLabel", anchor="w")
         self.status.pack(fill="x", pady=(6, 0))
 
+    def _update_unit_labels(self):
+        """Switch the σ / opening labels — and their values — between px and µm."""
+        px = self._default_px()
+        if self.var_phys.get():
+            self.param_labels["sigma_px"].config(text="Gaussian σ (µm)")
+            self.param_labels["opening_radius_px"].config(text="Opening 반경 (µm)")
+            for key, factor in (("sigma_px", px), ("opening_radius_px", px)):
+                try:
+                    self.v[key].set(f"{float(self.v[key].get()) * factor:.4g}")
+                except ValueError:
+                    pass
+        else:
+            self.param_labels["sigma_px"].config(text="Gaussian σ (px)")
+            self.param_labels["opening_radius_px"].config(text="Opening 반경 (px)")
+            for key in ("sigma_px", "opening_radius_px"):
+                try:
+                    self.v[key].set(f"{float(self.v[key].get()) / px:.4g}")
+                except (ValueError, ZeroDivisionError):
+                    pass
+
     def _mode_key(self) -> str:
         label = self.var_mode.get()
         for name, key in THRESHOLD_MODES:
@@ -522,37 +613,105 @@ class App:
             text="권장 설정 적용: 대비 정규화 + Otsu(일괄). "
                  "모든 이미지에 같은 임계값이 적용되며, 결과 표의 '적용 임계' 열에서 확인하실 수 있습니다.")
 
-    def _measure_scale(self):
-        path = self._selected_path() or (self.files[0] if self.files else None)
-        if path is None:
-            messagebox.showinfo("이미지 없음",
-                                "스케일바를 측정할 이미지를 먼저 추가하십시오.")
-            return
+    # ------------------------------------------------- pixel size per image
+    def _default_px(self) -> float:
         try:
-            value = measure_scale_bar(self.root, path)
-        except Exception:
-            messagebox.showerror("측정 실패", traceback.format_exc(limit=3))
-            return
-        if value:
-            self.v["pixel_size_um"].set(f"{value:.6g}")
-            self.lbl_px_src.config(text=f"스케일바 측정값 · {os.path.basename(path)}")
-            self.status.config(text=f"픽셀 크기를 {format_pixel_size(value)}로 설정했습니다.")
+            return float(self.v["pixel_size_um"].get())
+        except ValueError:
+            return 0.404
 
-    def _autofill_pixel_size(self, path):
-        """Take µm/px from the file's own metadata, once, without overriding a
-        value the user has already set by hand."""
-        if getattr(self, "_px_locked", False):
+    def _px_for(self, path) -> float:
+        """The scale to use for one image: its own if known, else the default."""
+        value, _src = self.px_info.get(path, (None, ""))
+        return value if value else self._default_px()
+
+    def _refresh_all_rows(self):
+        # Labels are computed over the whole batch: two folders often hold the
+        # same file names, and "site01.tif" twice tells the user nothing.
+        labels = unique_labels(self.files)
+        for path in self.files:
+            if not self.flist.exists(path):
+                continue
+            value, src = self.px_info.get(path, (None, ""))
+            name = labels.get(path, os.path.basename(path))
+            if value:
+                self.flist.item(path, values=(name, f"{value:.4g}", src), tags=())
+            else:
+                self.flist.item(path, values=(name, f"{self._default_px():.4g}",
+                                              "기본값 사용"), tags=("unknown",))
+        self._check_mixed_scales()
+
+    def _check_mixed_scales(self):
+        """Tell the user plainly when the batch mixes magnifications."""
+        scales = {round(self._px_for(p), 6) for p in self.files}
+        unknown = [p for p in self.files if not self.px_info.get(p, (None,))[0]]
+        parts = []
+        if len(scales) > 1:
+            lo, hi = min(scales), max(scales)
+            parts.append(f"배율 혼재: 픽셀 크기가 {lo:.4g}–{hi:.4g} µm/px로 다릅니다"
+                         f" ({len(scales)}종). 개공률 자체는 배율에 불변이지만, "
+                         f"σ·opening을 µm로 지정하셔야 물리적 기준이 같아집니다.")
+        if unknown:
+            parts.append(f"{len(unknown)}개 이미지는 픽셀 크기를 모릅니다 — "
+                         f"기본값 {self._default_px():.4g}를 씁니다.")
+        self.lbl_mixed.config(text="  ".join(parts))
+        return len(scales) > 1
+
+    def _edit_pixel_size(self, _event=None):
+        paths = list(self.flist.selection()) or (self.files[:1] if self.files else [])
+        if not paths:
+            messagebox.showinfo("이미지 없음", "먼저 이미지를 추가하고 선택하십시오.")
             return
-        got = read_pixel_size(path)
-        if not got:
-            return
-        value, source = got
-        self.v["pixel_size_um"].set(f"{value:.6g}")
-        self.lbl_px_src.config(text=f"{source} · {os.path.basename(path)}")
-        self._px_locked = True
+        _PixelSizeDialog(self, paths)
+
+    def _set_pixel_size(self, paths, value, source):
+        for path in paths:
+            self.px_info[path] = (value, source)
+            self.scale_store.put(path, value, source)
+        saved = self.scale_store.save()
+        self._refresh_all_rows()
+        names = ", ".join(os.path.basename(p) for p in paths[:3])
+        more = f" 외 {len(paths)-3}개" if len(paths) > 3 else ""
         self.status.config(
-            text=f"{os.path.basename(path)}의 메타데이터에서 픽셀 크기 "
-                 f"{format_pixel_size(value)}를 읽었습니다. [{source}]")
+            text=f"{names}{more} 픽셀 크기를 {format_pixel_size(value)}로 "
+                 f"설정했습니다. [{source}]"
+                 + ("  다음 실행에서도 기억합니다." if saved else
+                    "  (저장 실패 — 이번 실행에만 적용됩니다.)"))
+
+    def _measure_scale(self):
+        """Scale-bar button in the parameter panel: acts on the selected image."""
+        self._edit_pixel_size()
+
+    def _autofill_pixel_size(self, paths):
+        """Read µm/px from each new file's own metadata."""
+        found = remembered = 0
+        for path in paths:
+            if path in self.px_info:
+                continue
+            # A value the user measured by hand outranks the file's metadata:
+            # they set it precisely because the metadata was absent or wrong.
+            saved = self.scale_store.get(path)
+            if saved:
+                self.px_info[path] = saved
+                remembered += 1
+                continue
+            got = read_pixel_size(path)
+            self.px_info[path] = got if got else (None, "")
+            if got:
+                found += 1
+        self._refresh_all_rows()
+        if remembered:
+            self.status.config(
+                text=f"{remembered}개 이미지는 이전에 지정하신 픽셀 크기를 복원했습니다"
+                     + (f", {found}개는 메타데이터에서 읽었습니다." if found else "."))
+            return
+        if found:
+            first = next(p for p in paths if self.px_info.get(p, (None,))[0])
+            value, source = self.px_info[first]
+            self.lbl_px_src.config(text=f"{found}개 이미지에서 자동 인식")
+            self.status.config(
+                text=f"{found}개 이미지의 메타데이터에서 픽셀 크기를 읽었습니다 "
+                     f"(예: {os.path.basename(first)} = {format_pixel_size(value)}, {source}).")
 
     def _set_drop_hint(self):
         self.lbl_hint.config(
@@ -621,39 +780,45 @@ class App:
         self._add_files(paths)
 
     def _add_files(self, paths):
-        added = 0
+        new = []
         for p in paths:
             p = str(p).strip("{}")
             if os.path.isdir(p):
                 for fn in sorted(os.listdir(p)):
                     fp = os.path.join(p, fn)
                     if fp.lower().endswith(IMAGE_EXT) and fp not in self.files:
-                        self.files.append(fp)
-                        self.lst.insert("end", os.path.basename(fp))
-                        added += 1
+                        new.append(fp)
             elif p.lower().endswith(IMAGE_EXT) and p not in self.files:
-                self.files.append(p)
-                self.lst.insert("end", os.path.basename(p))
-                added += 1
-        if added:
-            self.status.config(text=f"{added}개 추가 — 총 {len(self.files)}개")
-            self._autofill_pixel_size(self.files[0])
+                new.append(p)
+        for fp in new:
+            self.files.append(fp)
+            self.flist.insert("", "end", iid=fp,
+                              values=(os.path.basename(fp), "", ""))
+        if new:
+            self.status.config(text=f"{len(new)}개 추가 — 총 {len(self.files)}개")
+            self._autofill_pixel_size(new)
 
     def _remove_sel(self):
-        for i in sorted(self.lst.curselection(), reverse=True):
-            self.results.pop(self.files[i], None)
-            del self.files[i]
-            self.lst.delete(i)
+        for path in list(self.flist.selection()):
+            self.results.pop(path, None)
+            self.px_info.pop(path, None)
+            if path in self.files:
+                self.files.remove(path)
+            self.flist.delete(path)
         self._refresh_table()
+        self._check_mixed_scales()
 
     def _clear(self):
         self.files.clear()
         self.results.clear()
-        self.lst.delete(0, "end")
+        self.px_info.clear()
+        self.flist.delete(*self.flist.get_children())
         self._refresh_table()
         self.canvas.delete("all")
         self.lbl_big.config(text="개공률 —")
         self.lbl_sub.config(text="")
+        self.lbl_mixed.config(text="")
+        self.lbl_px_src.config(text="")
 
     # ------------------------------------------------------------ params
     def _params(self) -> Params:
@@ -662,13 +827,16 @@ class App:
                 return cast(self.v[key].get())
             except ValueError:
                 raise ValueError(f"'{key}' 값이 숫자가 아닙니다: {self.v[key].get()}")
+        phys = self.var_phys.get()
         p = Params(
             pixel_size_um=f("pixel_size_um"),
-            sigma_px=f("sigma_px"),
+            sigma_px=1.2 if phys else f("sigma_px"),
+            sigma_um=f("sigma_px") if phys else None,
             threshold=f("threshold"),
             min_diam_um=f("min_diam_um"),
             solidity_cut=f("solidity_cut"),
-            opening_radius_px=f("opening_radius_px", int),
+            opening_radius_px=2 if phys else f("opening_radius_px", int),
+            opening_radius_um=f("opening_radius_px") if phys else None,
             crop_top_px=f("crop_top_px", int),
             crop_bottom_px=f("crop_bottom_px", int),
             exclude_border=self.var_border.get(),
@@ -694,27 +862,31 @@ class App:
             messagebox.showerror("입력 오류", str(e))
             return
         self._busy = True
+        self._failures = []
         self.btn_run.config(state="disabled")
         # Read every Tk variable here, on the main thread. Tkinter is not
         # thread-safe: touching a Tk variable from the worker deadlocks Tcl.
         autocrop = self.var_autocrop.get()
+        px_map = {path: self._px_for(path) for path in self.files}
+        labels = unique_labels(self.files)
         threading.Thread(target=self._worker,
-                         args=(list(self.files), p, autocrop), daemon=True).start()
+                         args=(list(self.files), p, autocrop, px_map, labels),
+                         daemon=True).start()
 
-    def _worker(self, files, p, autocrop):
-        # Pass 1: settle the crop for each file. The batch threshold has to be
-        # computed from exactly the pixels that will be analysed, so cropping
-        # must be decided before the histogram is pooled.
+    def _worker(self, files, p, autocrop, px_map, labels):
+        # Pass 1: settle each file's own scale and crop. The batch threshold has
+        # to be computed from exactly the pixels that will be analysed, so
+        # cropping must be decided before the histogram is pooled.
         plans = []
         for path in files:
-            pp = p
+            pp = p.copy_with(pixel_size_um=px_map.get(path, p.pixel_size_um))
             if autocrop and p.crop_top_px == 0 and p.crop_bottom_px == 0:
                 try:
                     top, bot = detect_bands(load_gray(path))
                 except Exception:
                     top = bot = 0
                 if top or bot:
-                    pp = p.copy_with(crop_top_px=top, crop_bottom_px=bot)
+                    pp = pp.copy_with(crop_top_px=top, crop_bottom_px=bot)
             plans.append((path, pp))
 
         # Pass 2: one threshold from all images, when that mode is selected.
@@ -742,10 +914,19 @@ class App:
         for i, (path, pp) in enumerate(plans, 1):
             try:
                 self._q.put(("status",
-                             f"[{i}/{len(plans)}] {os.path.basename(path)} 분석 중…"))
+                             f"[{i}/{len(plans)}] {labels.get(path, os.path.basename(path))} "
+                             f"분석 중…"))
                 gray = load_gray(path, pp.crop_bottom_px, pp.crop_top_px)
-                res = analyze_array(gray, pp, source=os.path.basename(path),
+                res = analyze_array(gray, pp,
+                                    source=labels.get(path, os.path.basename(path)),
                                     forced_threshold=forced)
+                res.source_path = path
+                # Keep only what the preview needs. A full-resolution overlay is
+                # ~9 MiB for a 2048x1536 SEM image, so a 100-image batch would
+                # sit on close to a gigabyte of pictures drawn at 460 px wide.
+                # The full one is regenerated on demand when saving.
+                res.binary = None
+                res.overlay = _shrink_overlay(res.overlay)
                 self._q.put(("result", (path, res, pp)))
             except Exception:
                 self._q.put(("error", (path, traceback.format_exc(limit=3))))
@@ -763,17 +944,40 @@ class App:
                     self.results[path] = res
                     self._refresh_table()
                 elif kind == "error":
+                    # Collect, never interrupt. One modal per bad file would
+                    # stall a batch behind a dialog nobody is there to close.
                     path, tb = payload
-                    self.status.config(text=f"실패: {os.path.basename(path)}")
-                    messagebox.showerror("분석 실패", f"{os.path.basename(path)}\n\n{tb}")
+                    self._failures.append((path, tb))
+                    self.status.config(
+                        text=f"실패 {len(self._failures)}건 — {os.path.basename(path)} "
+                             f"(계속 진행합니다)")
                 elif kind == "done":
                     self._busy = False
                     self.btn_run.config(state="normal")
-                    self.status.config(text=f"완료 — {len(self.results)}개 결과")
+                    self._report_failures()
                     self._show_preview()
         except queue.Empty:
             pass
         self.root.after(80, self._drain_queue)
+
+    def _report_failures(self):
+        """One summary at the end, rather than a dialog per failed file."""
+        ok = len(self.results)
+        if not self._failures:
+            self.status.config(text=f"완료 — {ok}개 결과")
+            return
+        n = len(self._failures)
+        self.status.config(text=f"완료 — 성공 {ok}개, 실패 {n}개")
+        lines = []
+        for path, tb in self._failures[:10]:
+            last = [ln for ln in tb.strip().splitlines() if ln.strip()][-1]
+            lines.append(f"• {os.path.basename(path)}\n    {last.strip()[:110]}")
+        more = f"\n… 외 {n - 10}건" if n > 10 else ""
+        messagebox.showwarning(
+            "일부 파일 분석 실패",
+            f"{ok}개는 정상 분석되었고 {n}개가 실패했습니다.\n"
+            f"실패한 파일은 결과와 CSV에서 제외됩니다.\n\n"
+            + "\n".join(lines) + more)
 
     def _run_sweep(self):
         sel = self._selected_path()
@@ -836,9 +1040,9 @@ class App:
         sel = self.tree.selection()
         if sel:
             return sel[0]
-        idx = self.lst.curselection()
-        if idx:
-            return self.files[idx[0]]
+        sel = self.flist.selection()
+        if sel:
+            return sel[0]
         for path in self.files:
             if path in self.results:
                 return path
@@ -918,8 +1122,113 @@ class App:
                                           initialfile=f"{base}_overlay.png")
         if not fp:
             return
-        Image.fromarray(self.results[path].overlay).save(fp)
-        self.status.config(text=f"오버레이 저장: {fp}")
+        res = self.results[path]
+        used = getattr(res, "used_params", None)
+        overlay = res.overlay
+        if used is not None:
+            # Only a preview-sized copy is kept in memory; redo this one image
+            # so the saved file is at the original resolution.
+            self.status.config(text="원본 해상도로 오버레이를 다시 그리는 중…")
+            self.root.update_idletasks()
+            try:
+                gray = load_gray(path, used.crop_bottom_px, used.crop_top_px)
+                full = analyze_array(gray, used, source=res.source,
+                                     forced_threshold=res.effective_threshold)
+                overlay = full.overlay
+            except Exception:
+                pass                       # fall back to the preview-sized one
+        Image.fromarray(overlay).save(fp)
+        self.status.config(text=f"오버레이 저장: {fp}  ({overlay.shape[1]}×{overlay.shape[0]} px)")
+
+
+class _PixelSizeDialog:
+    """Set µm/px for the selected images: type it, or measure the scale bar."""
+
+    def __init__(self, app, paths):
+        self.app = app
+        self.paths = paths
+        first = paths[0]
+
+        win = tk.Toplevel(app.root)
+        self.win = win
+        win.title("픽셀 크기 지정")
+        win.transient(app.root)
+        win.resizable(False, False)
+
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        names = ", ".join(os.path.basename(p) for p in paths[:3])
+        more = f" 외 {len(paths)-3}개" if len(paths) > 3 else ""
+        ttk.Label(frm, text=f"대상: {names}{more}", wraplength=380,
+                  justify="left").pack(anchor="w")
+
+        cur, src = app.px_info.get(first, (None, ""))
+        ttk.Label(frm, style="Hint.TLabel", wraplength=380, justify="left",
+                  text=(f"현재 값: {format_pixel_size(cur)}  [{src}]" if cur
+                        else "현재 값 없음 — 분석 시 기본값이 쓰입니다.")
+                  ).pack(anchor="w", pady=(2, 10))
+
+        row = ttk.Frame(frm)
+        row.pack(anchor="w")
+        ttk.Label(row, text="µm/px").pack(side="left", padx=(0, 6))
+        self.var = tk.StringVar(value=f"{cur:.6g}" if cur else
+                                f"{app._default_px():.6g}")
+        ttk.Entry(row, textvariable=self.var, width=14).pack(side="left")
+
+        ttk.Button(frm, text="스케일바로 측정…", command=self._measure
+                   ).pack(anchor="w", pady=(10, 0))
+        ttk.Label(frm, style="Hint.TLabel", wraplength=380, justify="left",
+                  text="첫 번째 이미지를 원본 그대로 띄워 스케일바를 재고, "
+                       "그 값을 위 칸에 넣습니다."
+                  ).pack(anchor="w")
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(14, 0))
+        ttk.Button(btns, text="적용", command=self._apply).pack(side="right")
+        ttk.Button(btns, text="취소", command=win.destroy).pack(side="right", padx=6)
+        if len(app.files) > len(paths):
+            ttk.Button(btns, text="전체 이미지에 적용",
+                       command=self._apply_all).pack(side="left")
+
+        win.bind("<Return>", lambda e: self._apply())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.update_idletasks()
+        win.grab_set()
+
+    def _measure(self):
+        try:
+            value = measure_scale_bar(self.win, self.paths[0])
+        except Exception:
+            messagebox.showerror("측정 실패", traceback.format_exc(limit=3),
+                                 parent=self.win)
+            return
+        if value:
+            self.var.set(f"{value:.6g}")
+            self._source = "스케일바 측정"
+
+    def _value(self):
+        try:
+            v = float(self.var.get())
+        except ValueError:
+            messagebox.showerror("입력 오류", "숫자를 입력하십시오.", parent=self.win)
+            return None
+        if v <= 0:
+            messagebox.showerror("입력 오류", "픽셀 크기는 0보다 커야 합니다.",
+                                 parent=self.win)
+            return None
+        return v
+
+    def _apply(self, targets=None):
+        v = self._value()
+        if v is None:
+            return
+        self.app._set_pixel_size(targets or self.paths, v,
+                                 getattr(self, "_source", "직접 입력"))
+        self.win.destroy()
+
+    def _apply_all(self):
+        self._apply(targets=list(self.app.files))
 
 
 def main():

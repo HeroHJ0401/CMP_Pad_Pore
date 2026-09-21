@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 from pore_analyzer.core import (Params, analyze_array, robustness_sweep,
-                                detect_bands, pooled_otsu)
+                                detect_bands, pooled_otsu, unique_labels)
 from pore_analyzer.pixelsize import from_scale_bar
 from tests.make_sample import make
 
@@ -85,6 +85,62 @@ def main():
                    abs(ra.effective_threshold - rb.effective_threshold) < 1e-12))
     checks.append(("effective threshold is recorded",
                    np.isfinite(ra.effective_threshold)))
+
+    # ---- pixel size: what it does and does not touch ----------------------
+    # The open-pore fraction divides an area by an area, so the pixel size
+    # cancels. It reaches the number only through the min-diameter filter,
+    # which is stated in µm. Getting this wrong would silently rescale a batch.
+    free = Params(min_diam_um=0.0)
+    invariant = [analyze_array(gray, free.copy_with(pixel_size_um=s)).open_pore_fraction
+                 for s in (0.101, 0.404, 0.808)]
+    checks.append(("open-pore fraction is scale-invariant",
+                   max(invariant) - min(invariant) < 1e-12))
+
+    filtered = [analyze_array(gray, Params(pixel_size_um=s)).open_pore_fraction
+                for s in (0.101, 0.404)]
+    checks.append(("min-diameter filter is what makes scale matter",
+                   abs(filtered[0] - filtered[1]) > 1e-6))
+
+    shapes = [analyze_array(gray, free.copy_with(pixel_size_um=s)).circularity_median
+              for s in (0.101, 0.808)]
+    checks.append(("circularity is dimensionless", abs(shapes[0] - shapes[1]) < 1e-12))
+
+    # ---- physical units keep σ the same size at any magnification ---------
+    # This is asserted as an exact property of the conversion, not as an
+    # empirical improvement on some test image: what µm units guarantee is that
+    # the smoothing and opening cover the same physical distance at every
+    # magnification, so the filters mean the same thing in every image.
+    phys = Params(sigma_um=0.5, opening_radius_um=0.8)
+    same_physical_sigma = {
+        round(phys.copy_with(pixel_size_um=s).resolved_sigma_px() * s, 9)
+        for s in (0.101, 0.202, 0.404, 0.808)}
+    checks.append(("σ in µm is the same physical size at every scale",
+                   same_physical_sigma == {0.5}))
+    checks.append(("σ in px is NOT the same physical size",
+                   len({round(Params(pixel_size_um=s).resolved_sigma_px() * s, 9)
+                        for s in (0.101, 0.404)}) == 2))
+    checks.append(("opening in µm scales with the image",
+                   phys.copy_with(pixel_size_um=0.404).resolved_opening_px() == 2
+                   and phys.copy_with(pixel_size_um=0.202).resolved_opening_px() == 4))
+    checks.append(("px values still work when µm is unset",
+                   Params(sigma_px=1.2).resolved_sigma_px() == 1.2
+                   and Params(opening_radius_px=2).resolved_opening_px() == 2))
+    checks.append(("per-image scale is recorded in the result",
+                   analyze_array(gray, Params(pixel_size_um=0.202)).pixel_size_um == 0.202))
+
+    # ---- labels must stay unique across folders ---------------------------
+    import os as _os
+    clash = [_os.path.join("x", "cond_A", "site01.tif"),
+             _os.path.join("x", "cond_B", "site01.tif"),
+             _os.path.join("x", "cond_A", "site02.tif")]
+    labs = unique_labels(clash)
+    checks.append(("duplicate basenames get distinct labels",
+                   len(set(labs.values())) == 3))
+    checks.append(("unique basenames stay short",
+                   labs[clash[2]] == "site02.tif"))
+    checks.append(("a single file needs no folder prefix",
+                   unique_labels([_os.path.join("a", "b.tif")])[_os.path.join("a", "b.tif")]
+                   == "b.tif"))
 
     # ---- scale bar arithmetic --------------------------------------------
     checks.append(("scale bar µm/px", abs(from_scale_bar(250, 100, "µm") - 0.4) < 1e-12))

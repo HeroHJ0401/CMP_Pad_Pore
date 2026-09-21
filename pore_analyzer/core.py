@@ -26,7 +26,7 @@ from PIL import Image
 
 __all__ = ["Params", "Result", "analyze_path", "analyze_array",
            "robustness_sweep", "detect_bands", "load_gray",
-           "prepare", "pooled_otsu"]
+           "prepare", "pooled_otsu", "unique_labels"]
 
 
 # --------------------------------------------------------------------------
@@ -58,6 +58,25 @@ class Params:
     norm_low_pct: float = 1.0         # percentile mapped to 0 when normalizing
     norm_high_pct: float = 99.0       # percentile mapped to 1 when normalizing
 
+    # Smoothing and opening are pixel operations, so at two magnifications the
+    # same pixel count is a different physical size. Setting these in µm keeps
+    # the physical scale identical across images taken at different mags, which
+    # is what makes their numbers comparable. None = use the _px value above.
+    sigma_um: Optional[float] = None
+    opening_radius_um: Optional[float] = None
+
+    def resolved_sigma_px(self) -> float:
+        if self.sigma_um is None:
+            return self.sigma_px
+        return self.sigma_um / self.pixel_size_um if self.pixel_size_um > 0 else 0.0
+
+    def resolved_opening_px(self) -> int:
+        if self.opening_radius_um is None:
+            return int(self.opening_radius_px)
+        if self.pixel_size_um <= 0:
+            return 0
+        return max(0, int(round(self.opening_radius_um / self.pixel_size_um)))
+
     def copy_with(self, **kw) -> "Params":
         d = asdict(self)
         d.update(kw)
@@ -68,7 +87,8 @@ class Params:
 class Result:
     """Per-image analysis output."""
 
-    source: str = ""
+    source: str = ""            # label shown to the user (unique within a batch)
+    source_path: str = ""       # the file it came from
     width_px: int = 0
     height_px: int = 0
     field_area_um2: float = 0.0
@@ -96,6 +116,9 @@ class Result:
 
     otsu_threshold: float = float("nan")    # this image's own Otsu value
     effective_threshold: float = float("nan")  # what was actually applied
+    pixel_size_um: float = float("nan")     # the scale used for THIS image
+    sigma_px_used: float = float("nan")
+    opening_px_used: int = 0
 
     # heavy payloads (not written to CSV)
     objects: list = field(default_factory=list, repr=False)
@@ -106,6 +129,8 @@ class Result:
         """Flat dict for CSV / table display."""
         return {
             "file": self.source,
+            "path": self.source_path,
+            "pixel_size_um": _r(self.pixel_size_um, 6),
             "width_px": self.width_px,
             "height_px": self.height_px,
             "field_w_um": round(self.field_w_um, 2),
@@ -126,6 +151,9 @@ class Result:
             "border_area_fraction_pct": round(100 * self.border_area_fraction, 2),
             "effective_threshold": _r(self.effective_threshold, 4),
             "otsu_threshold_ref": _r(self.otsu_threshold, 3),
+            "sigma_px_used": _r(self.sigma_px_used, 3),
+            "sigma_um_used": _r(self.sigma_px_used * self.pixel_size_um, 4),
+            "opening_px_used": self.opening_px_used,
         }
 
 
@@ -249,7 +277,8 @@ def prepare(gray: np.ndarray, p: Params) -> np.ndarray:
         lo, hi = np.percentile(g, [p.norm_low_pct, p.norm_high_pct])
         if hi > lo:
             g = np.clip((g - lo) / (hi - lo), 0.0, 1.0)
-    return ndi.gaussian_filter(g, sigma=p.sigma_px) if p.sigma_px > 0 else g
+    sigma = p.resolved_sigma_px()
+    return ndi.gaussian_filter(g, sigma=sigma) if sigma > 0 else g
 
 
 def pooled_otsu(grays, p: Params, max_px_per_image: int = 400_000) -> float:
@@ -292,6 +321,9 @@ def analyze_array(gray: np.ndarray, p: Params, source: str = "",
     res.field_w_um = w * p.pixel_size_um
     res.field_h_um = h * p.pixel_size_um
     res.field_area_um2 = res.field_w_um * res.field_h_um
+    res.pixel_size_um = p.pixel_size_um
+    res.sigma_px_used = p.resolved_sigma_px()
+    res.opening_px_used = p.resolved_opening_px()
 
     # ---- normalize + smooth --------------------------------------------
     sm = prepare(gray, p)
@@ -316,8 +348,9 @@ def analyze_array(gray: np.ndarray, p: Params, source: str = "",
     res.dark_area_fraction = float(binary.mean())
 
     # ---- morphological opening ----------------------------------------
-    if p.opening_radius_px and p.opening_radius_px > 0:
-        binary = morphology.opening(binary, morphology.disk(p.opening_radius_px))
+    open_px = p.resolved_opening_px()
+    if open_px > 0:
+        binary = morphology.opening(binary, morphology.disk(open_px))
 
     # ---- labeling & metrics -------------------------------------------
     lbl = measure.label(binary, connectivity=2)
@@ -421,11 +454,45 @@ def _make_overlay(gray: np.ndarray, lbl: np.ndarray, kept: list, p: Params) -> n
     return np.clip(rgb, 0, 255).astype(np.uint8)
 
 
-def analyze_path(path: str, p: Params) -> Result:
+def unique_labels(paths) -> dict:
+    """
+    A short, unique label per path.
+
+    A batch often spans folders that hold the same file names — cond_A/site01
+    and cond_B/site01 — and showing both as "site01" makes the table and the
+    CSV ambiguous. Parent folders are prepended only until the names separate.
+    """
+    import os
+    paths = list(paths)
+    labels = {p: os.path.basename(p) for p in paths}
+    for _ in range(8):
+        counts = {}
+        for lab in labels.values():
+            counts[lab] = counts.get(lab, 0) + 1
+        clashing = [p for p in paths if counts[labels[p]] > 1]
+        if not clashing:
+            break
+        grew = False
+        for p in clashing:
+            head = p
+            for _ in range(labels[p].count(os.sep) + 1):
+                head = os.path.dirname(head)
+            parent = os.path.basename(head)
+            if parent:
+                labels[p] = os.path.join(parent, labels[p])
+                grew = True
+        if not grew:
+            break
+    return labels
+
+
+def analyze_path(path: str, p: Params, label: str = None) -> Result:
     """Load an image file and analyze it."""
     gray = load_gray(path, crop_bottom_px=p.crop_bottom_px, crop_top_px=p.crop_top_px)
     import os
-    return analyze_array(gray, p, source=os.path.basename(path))
+    res = analyze_array(gray, p, source=label or os.path.basename(path))
+    res.source_path = path
+    return res
 
 
 # --------------------------------------------------------------------------

@@ -11,7 +11,7 @@ import sys
 from PIL import Image
 
 from .core import (Params, analyze_array, load_gray, robustness_sweep,
-                   detect_bands, pooled_otsu)
+                   detect_bands, pooled_otsu, unique_labels)
 from .pixelsize import read_pixel_size, format_pixel_size
 
 
@@ -37,6 +37,11 @@ def build_parser():
                     help="이미지마다 대비를 정규화한 뒤 임계 적용 (밝기 차이 상쇄)")
     ap.add_argument("--auto-pixel-size", action="store_true",
                     help="파일 메타데이터에서 픽셀 크기를 읽어 --pixel-size 대신 사용")
+    ap.add_argument("--sigma-um", type=float, default=None,
+                    help="평활 σ를 µm로 지정 (--sigma 대신). 배율이 다른 이미지를 "
+                         "함께 분석할 때 물리적 기준을 맞춤")
+    ap.add_argument("--opening-um", type=float, default=None,
+                    help="Opening 반경을 µm로 지정 (--opening-radius 대신)")
     ap.add_argument("--csv", metavar="PATH", help="결과를 CSV로 저장")
     ap.add_argument("--overlay-dir", metavar="DIR", help="오버레이 PNG를 저장할 디렉터리")
     ap.add_argument("--sweep", action="store_true", help="임계×solidity 강건성 스윕도 출력")
@@ -75,6 +80,8 @@ def main(argv=None):
         exclude_border=not args.keep_border,
         normalize_contrast=args.normalize,
         threshold_mode=args.mode.replace("-", "_"),
+        sigma_um=args.sigma_um,
+        opening_radius_um=args.opening_um,
     )
 
     # settle cropping (and, if asked, pixel size) per file before anything else
@@ -98,6 +105,16 @@ def main(argv=None):
                       f"--pixel-size {p.pixel_size_um} 사용)")
         plans.append((path, p))
 
+    # Mixed magnifications are allowed, but say so: the open-pore fraction is
+    # scale-invariant while σ and opening are not, unless given in µm.
+    scales = {round(p.pixel_size_um, 6) for _path, p in plans}
+    if len(scales) > 1:
+        print(f"\n[주의] 배율 혼재 — 픽셀 크기가 {min(scales):.4g}–{max(scales):.4g} "
+              f"µm/px로 {len(scales)}종입니다.")
+        if base.sigma_um is None or base.opening_radius_um is None:
+            print("       σ·opening이 픽셀 단위라 이미지마다 물리적 크기가 다릅니다. "
+                  "--sigma-um / --opening-um 으로 지정하시면 기준이 같아집니다.")
+
     forced = None
     if base.threshold_mode == "otsu_batch":
         def grays():
@@ -110,11 +127,15 @@ def main(argv=None):
             forced = None
             print("\n공통 임계값을 구하지 못해 고정 임계값을 사용합니다.")
 
+    # Batches often span folders holding the same file names; label them so
+    # the console output and the CSV stay unambiguous.
+    labels = unique_labels([path for path, _ in plans])
+
     rows = []
     for path, p in plans:
         gray = load_gray(path, p.crop_bottom_px, p.crop_top_px)
-        res = analyze_array(gray, p, source=os.path.basename(path),
-                            forced_threshold=forced)
+        res = analyze_array(gray, p, source=labels[path], forced_threshold=forced)
+        res.source_path = path
         rows.append(res.summary_row())
 
         print(f"\n=== {res.source} ===")
@@ -136,9 +157,11 @@ def main(argv=None):
               f"(면적 {100*res.border_area_fraction:.1f} %)")
 
         if args.overlay_dir:
-            os.makedirs(args.overlay_dir, exist_ok=True)
-            stem = os.path.splitext(os.path.basename(path))[0]
+            # Name from the disambiguated label, or two folders holding the
+            # same file name would silently overwrite each other's overlay.
+            stem = os.path.splitext(labels[path])[0].replace(os.sep, "_")
             out = os.path.join(args.overlay_dir, f"{stem}_overlay.png")
+            os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
             Image.fromarray(res.overlay).save(out)
             print(f"  오버레이 저장  {out}")
 

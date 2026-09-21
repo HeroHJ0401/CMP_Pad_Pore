@@ -19,7 +19,8 @@ from typing import Optional, Tuple
 
 from PIL import Image
 
-__all__ = ["read_pixel_size", "from_scale_bar", "UNITS_UM", "format_pixel_size"]
+__all__ = ["read_pixel_size", "from_scale_bar", "UNITS_UM", "format_pixel_size",
+           "ScaleStore"]
 
 # multiplier that converts a length in that unit into µm
 UNITS_UM = {
@@ -203,3 +204,76 @@ def read_pixel_size(path: str) -> Optional[Tuple[float, str]]:
     if not (1e-6 < value < 1e3):          # 1 pm .. 1 mm per pixel
         return None
     return value, source
+
+
+# --------------------------------------------------------------------------
+# Remembering scales between runs
+# --------------------------------------------------------------------------
+
+class ScaleStore:
+    """
+    Remember a measured µm/px per image file across runs.
+
+    Measuring a scale bar is manual work, and a batch can hold dozens of
+    images. Losing that on exit would mean redoing it every session, so the
+    values are kept in a small JSON file keyed by absolute path. Values read
+    from metadata are not stored: those are free to recompute and would only
+    go stale if the file changed.
+    """
+
+    MAX_ENTRIES = 4000
+
+    def __init__(self, path: str = None):
+        self.path = path or self._default_path()
+        self.data = {}
+        self.load()
+
+    @staticmethod
+    def _default_path() -> str:
+        base = (os.environ.get("APPDATA")
+                or os.environ.get("XDG_CONFIG_HOME")
+                or os.path.join(os.path.expanduser("~"), ".config"))
+        return os.path.join(base, "cmp-pore-analyzer", "scales.json")
+
+    def load(self):
+        import json
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                self.data = {k: v for k, v in loaded.items()
+                             if isinstance(v, dict) and
+                             isinstance(v.get("um_per_px"), (int, float)) and
+                             0 < v["um_per_px"] < 1e3}
+        except (OSError, ValueError):
+            self.data = {}       # a missing or broken store is not an error
+
+    def save(self):
+        import json
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            items = list(self.data.items())[-self.MAX_ENTRIES:]
+            self.data = dict(items)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.data, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.path)     # never leave a half-written store
+            return True
+        except OSError:
+            return False                   # remembering is best-effort
+
+    def get(self, image_path: str):
+        """(um_per_px, source) remembered for this file, or None."""
+        rec = self.data.get(os.path.abspath(image_path))
+        if not rec:
+            return None
+        return rec["um_per_px"], rec.get("source", "이전 측정값")
+
+    def put(self, image_path: str, um_per_px: float, source: str):
+        if not (um_per_px and 0 < um_per_px < 1e3):
+            return
+        self.data[os.path.abspath(image_path)] = {
+            "um_per_px": float(um_per_px), "source": source}
+
+    def forget(self, image_path: str):
+        self.data.pop(os.path.abspath(image_path), None)
