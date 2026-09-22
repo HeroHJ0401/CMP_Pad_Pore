@@ -22,6 +22,7 @@ pip install pyinstaller || goto :fail
 echo [3/4] 실행 파일 빌드... (수 분 걸립니다)
 pyinstaller --noconfirm --clean --onefile --windowed ^
   --name CMP_PoreAnalyzer ^
+  --splash splash.png ^
   --collect-all skimage ^
   --collect-all tkinterdnd2 ^
   --hidden-import PIL._tkinter_finder ^

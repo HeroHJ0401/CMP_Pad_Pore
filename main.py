@@ -76,11 +76,29 @@ def main():
 
     argv = sys.argv[1:]
     if argv and argv[0] == "--cli":
+        try:                       # a frozen splash would otherwise linger
+            import pyi_splash
+            pyi_splash.close()
+        except Exception:
+            pass
         from pore_analyzer.cli import main as cli_main
         sys.exit(cli_main(argv[1:]))
 
-    from pore_analyzer.gui import main as gui_main
-    gui_main()
+    # The splash module imports nothing heavy, so the window is on screen
+    # before numpy/scipy/scikit-image start loading — several seconds in a
+    # frozen build, during which a silent screen looks like a failed launch.
+    files = [a for a in argv if not a.startswith("-")]
+    try:
+        from pore_analyzer.splash import start_gui_with_splash
+        start_gui_with_splash(initial_files=files)
+    except Exception:
+        try:                                            # plain path
+            from pore_analyzer.splash import _boot_splash
+            _boot_splash("close")
+        except Exception:
+            pass
+        from pore_analyzer.gui import main as gui_main
+        gui_main()
 
 
 if __name__ == "__main__":

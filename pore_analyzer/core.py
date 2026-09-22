@@ -101,6 +101,9 @@ class Result:
 
     dark_area_fraction: float = 0.0   # raw dark pixel fraction (diagnostic only)
     open_pore_fraction: float = 0.0   # PRIMARY metric: solidity>=cut area / field area
+    invalid_pore_fraction: float = 0.0  # solidity<cut  area / field area
+    total_pore_fraction: float = 0.0    # every kept object's area / field area
+    valid_count_ratio: float = float("nan")   # 1 - concave_ratio, by count
     border_area_fraction: float = 0.0 # area lost to frame-touching objects
 
     circularity_median: float = float("nan")
@@ -137,13 +140,19 @@ class Result:
             "field_h_um": round(self.field_h_um, 2),
             "n_objects": self.n_objects,
             "object_density_per_mm2": round(self.object_density_per_mm2, 1),
-            "open_pore_fraction_pct": round(100 * self.open_pore_fraction, 2),
+            # area fractions: total = valid + invalid
+            "pore_fraction_pct": round(100 * self.total_pore_fraction, 2),
+            "valid_pore_fraction_pct": round(100 * self.open_pore_fraction, 2),
+            "invalid_pore_fraction_pct": round(100 * self.invalid_pore_fraction, 2),
+            # bright (non-pore) share of the field; the dark share is kept too
+            "non_pore_area_pct": round(100 * (1.0 - self.dark_area_fraction), 2),
             "dark_area_fraction_pct": round(100 * self.dark_area_fraction, 2),
             "circularity_median": _r(self.circularity_median, 4),
             "circularity_IQR": f"{_r(self.circularity_q1,3)}-{_r(self.circularity_q3,3)}",
             "solidity_median": _r(self.solidity_median, 4),
             "solidity_IQR": f"{_r(self.solidity_q1,3)}-{_r(self.solidity_q3,3)}",
             "eqdiam_median_um": _r(self.eqdiam_median_um, 3),
+            "valid_ratio_pct": _r(100 * self.valid_count_ratio, 1),
             "concave_ratio_pct": _r(100 * self.concave_ratio, 1),
             "mean_convex_deficiency_pct": _r(100 * self.mean_convex_deficiency, 1),
             "n_rejected_small": self.n_rejected_small,
@@ -410,9 +419,15 @@ def analyze_array(gray: np.ndarray, p: Params, source: str = "",
         res.eqdiam_median_um = float(np.nanmedian(eqd))
         res.object_density_per_mm2 = len(kept) / (res.field_area_um2 / 1.0e6)
 
+        # The three area fractions partition the segmented pore area:
+        #   total = valid (solidity >= cut) + invalid (solidity < cut)
+        # `open_pore_fraction` is the valid one — the published metric.
         convex_mask = sol >= p.solidity_cut
         res.open_pore_fraction = float(area[convex_mask].sum() / res.field_area_um2)
+        res.invalid_pore_fraction = float(area[~convex_mask].sum() / res.field_area_um2)
+        res.total_pore_fraction = float(area.sum() / res.field_area_um2)
         res.concave_ratio = float((~convex_mask).sum() / len(kept))
+        res.valid_count_ratio = 1.0 - res.concave_ratio
         res.mean_convex_deficiency = float(np.nanmean(1.0 - sol))
     else:
         res.open_pore_fraction = 0.0

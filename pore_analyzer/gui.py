@@ -40,74 +40,166 @@ CONCAVE = "#e74c3c"     # solidity <  cut  -> excluded
 PANEL_W = 460           # preview panel width; also the label wrap width
 APP_NAME = "CMP Pad 개공율 분석기_정현진"
 
-# key, heading, width, tooltip
-COLS = [
-    ("file", "파일", 160,
-     "분석한 이미지 파일명입니다."),
-    ("pixel_size_um", "µm/px", 70,
-     "이 이미지에 적용된 픽셀 크기입니다. 이미지마다 다를 수 있습니다.\n\n"
-     "개공률은 분자와 분모가 모두 픽셀 크기의 제곱으로 스케일되므로 이 값에 "
-     "거의 영향을 받지 않습니다. 영향을 받는 것은 등가직경·밀도·시야, 그리고 "
-     "최소 등가직경(µm) 필터를 통과하는 객체의 범위입니다.\n\n"
-     "원형도와 solidity는 무차원이라 전혀 영향이 없습니다."),
-    ("n_objects", "객체수", 62,
-     "모든 필터를 통과해 형상 지표 계산에 사용된 어두운 영역의 개수입니다.\n\n"
-     "제외되는 것: 등가직경이 최소값 미만인 객체, 이미지 경계에 닿은 객체."),
-    ("open_pore_fraction_pct", "개공률 %", 80,
-     "주 지표입니다.\n\n"
-     "Solidity가 기준값 이상인 볼록 개구부들의 면적 합 ÷ 시야 전체 면적 × 100.\n\n"
-     "어두운 영역에는 노출된 기공과 표면 그림자가 섞여 있는데, 그림자 덩어리는 "
-     "대체로 오목하므로 solidity 기준으로 걸러냅니다. 그래서 단순 암부면적률과는 "
-     "값도 방향도 다를 수 있습니다.\n\n"
-     "주의: 임계값과 solidity 기준에 따라 절대값이 크게 움직입니다. 동일 설정에서 "
-     "두 조건을 비교한 대소 관계와 비율만 사용하십시오."),
-    ("dark_area_fraction_pct", "암부면적 %", 88,
-     "평활 후 이진화 임계값 미만인 픽셀의 비율입니다. 참고용입니다.\n\n"
-     "노출된 기공과 표면 그림자가 모두 포함되므로, 표면이 거칠수록 커지는 "
-     "거칠기 대리 지표에 가깝습니다. 이 값을 개공률로 쓰면 결론이 뒤집힐 수 "
-     "있습니다."),
-    ("circularity_median", "원형도 중앙값", 98,
-     "원형도 = 4πA / P²  (A: 면적, P: 둘레)\n\n"
-     "완전한 원이면 1, 길쭉하거나 가장자리가 복잡할수록 0에 가까워집니다. "
-     "전체 객체의 원형도를 구한 뒤 그 중앙값을 표시합니다.\n\n"
-     "값이 높을수록 개구부가 덜 폐색되어 원래 형태를 유지하고 있음을 시사합니다."),
-    ("solidity_median", "Solidity 중앙값", 108,
-     "Solidity = A / A_convex hull  (볼록 껍질 면적 대비 실제 면적)\n\n"
-     "1에 가까우면 오목한 결손이 없는 볼록한 형태이고, 낮을수록 개구부가 "
-     "무너진 asperity에 가려져 오목하게 잘려 나갔음을 뜻합니다.\n\n"
-     "개공률 분자에 포함할지 여부를 이 값으로 판정합니다."),
-    ("eqdiam_median_um", "등가직경 µm", 92,
-     "각 객체와 같은 면적을 갖는 원의 지름으로 환산한 값의 중앙값입니다.\n\n"
-     "등가직경 = 2 × √(A / π), 픽셀 크기를 곱해 µm로 변환합니다."),
-    ("object_density_per_mm2", "밀도 /mm²", 84,
-     "객체수 ÷ 시야 면적(mm²).\n\n"
-     "시야 면적은 (가로 픽셀 × 픽셀 크기) × (세로 픽셀 × 픽셀 크기)이며, "
-     "크롭된 영역은 제외됩니다."),
-    ("concave_ratio_pct", "오목비율 %", 84,
-     "Solidity가 기준값 미만인 객체의 개수 비율입니다.\n\n"
-     "면적이 아니라 개수 기준이며, 폐색된 개구부가 얼마나 흔한지를 나타냅니다."),
-    ("n_rejected_border", "프레임접촉", 80,
-     "이미지 경계에 닿아 제외된 객체의 개수입니다.\n\n"
-     "잘린 객체는 둘레와 볼록 껍질이 실제와 달라 원형도·solidity를 신뢰할 수 "
-     "없으므로 제외합니다. ('프레임 접촉 객체 제외'를 끄면 포함됩니다.)"),
-    ("border_area_fraction_pct", "접촉면적 %", 88,
-     "프레임 접촉으로 제외된 객체들이 차지하던 면적의 비율입니다.\n\n"
-     "큰 객체일수록 경계에 닿을 확률이 높으므로, 이 값이 크면 개공률은 그만큼 "
-     "과소평가된 상태입니다. 논문에 수치를 쓰실 때 함께 밝히시는 것이 정직합니다."),
-    ("effective_threshold", "적용 임계", 78,
-     "이 이미지에 실제로 적용된 이진화 임계값입니다.\n\n"
-     "'고정'에서는 입력하신 값 그대로이고, 'Otsu(이미지별)'에서는 이미지마다 "
-     "다르며, 'Otsu(일괄)'에서는 모든 이미지가 같은 값을 갖습니다.\n\n"
-     "두 조건을 비교하실 때는 이 열의 값이 서로 같은지 반드시 확인하십시오. "
-     "값이 다르면 개공률 차이에 임계값 차이가 섞여 들어갑니다."),
-    ("otsu_threshold_ref", "Otsu(참고)", 84,
-     "이 이미지 한 장만으로 산출한 Otsu 임계값입니다. 모드가 "
-     "'Otsu(이미지별)'일 때만 실제로 쓰이고, 그 외에는 참고용입니다.\n\n"
-     "설정하신 고정 임계값이 이 값과 크게 다르면, 밝기나 대비가 다른 이미지를 "
-     "같은 고정 임계로 비교하고 있다는 신호입니다. 그럴 때는 '대비 정규화'를 "
-     "켜시거나 'Otsu(일괄)'로 바꾸십시오."),
+# ============================================================================
+#  결과 표의 열 — 구조
+# ----------------------------------------------------------------------------
+#  (내부키, 표시이름, 폭) 세 가지입니다.
+#    내부키   : 계산 결과와 CSV 헤더를 잇는 식별자. 바꾸지 마십시오.
+#    표시이름 : 표 머리글에 보이는 글자. 자유롭게 바꾸셔도 됩니다.
+#    폭       : 픽셀 단위 열 너비.
+#  순서를 바꾸시면 표와 CSV의 열 순서가 그대로 따라갑니다.
+#  각 열의 설명 문구는 아래 COL_HELP 에 따로 모아 두었습니다.
+# ============================================================================
+COLUMNS = [
+    ("file",                      "파일",              160),
+    ("pixel_size_um",             "µm/px",              70),
+    ("n_objects",                 "Pore 수",            66),
+    ("pore_fraction_pct",         "Pore 개공율 %",      96),
+    ("valid_pore_fraction_pct",   "유효 Pore 개공율 %", 120),
+    ("invalid_pore_fraction_pct", "무효 Pore 개공율 %", 120),
+    ("dark_area_fraction_pct",    "Pore 면적(필터전) %", 122),
+    ("non_pore_area_pct",         "Non-Pore 면적 %",    108),
+    ("circularity_median",        "Pore 원형도",        90),
+    ("solidity_median",           "유효 Pore 원형도",  110),
+    ("eqdiam_median_um",          "등가직경 µm",        92),
+    ("object_density_per_mm2",    "밀도 /mm²",          84),
+    ("valid_ratio_pct",           "유효 Pore 비율 %",  104),
+    ("concave_ratio_pct",         "무효 Pore 비율 %",  104),
+    ("n_rejected_border",         "프레임접촉",         80),
+    ("border_area_fraction_pct",  "접촉면적 %",         88),
+    ("effective_threshold",       "적용 임계",          78),
+    ("otsu_threshold_ref",        "Otsu(참고)",         84),
 ]
 
+# ############################################################################
+# #                                                                          #
+# #   설 명 문 구   —   이 아래는 전부 마음대로 고치셔도 됩니다               #
+# #                                                                          #
+# ############################################################################
+#
+#  여기에 있는 글자는 화면에 보이는 도움말일 뿐이고, 계산에는 전혀 쓰이지
+#  않습니다. 문장을 바꾸거나 지우거나 늘리셔도 결과 숫자는 달라지지 않습니다.
+#
+#  지키실 것은 파이썬 문법 두 가지뿐입니다.
+#    1) 왼쪽의 키("valid_pore_fraction_pct" 같은 것)는 건드리지 마십시오.
+#       오른쪽 따옴표 안의 글자만 고치십시오.
+#    2) 따옴표를 짝 맞춰 닫고, 줄을 이을 때는 각 줄을 따옴표로 감싸십시오.
+#         "첫 줄입니다. "
+#         "이어지는 줄입니다."
+#       \n 은 줄바꿈, \n\n 은 한 줄 띄우기입니다.
+#
+#  COL_HELP    : 결과 표의 열 머리글에 마우스를 올렸을 때
+#  PARAM_HELP  : 분석 조건의 항목 이름에 마우스를 올렸을 때
+#  CHECK_HELP  : 체크박스에 마우스를 올렸을 때
+#  MODE_HELP   : 임계 모드 선택기에 마우스를 올렸을 때
+#
+# ############################################################################
+
+# ---------------------------------------------------------------- 결과 표 열
+COL_HELP = {
+    "file":
+        "분석한 이미지 파일명입니다.\n\n"
+        "폴더가 다른 동명 파일은 폴더명이 앞에 붙어 구분됩니다.",
+    "pixel_size_um":
+        "이 이미지에 적용된 픽셀 크기입니다. 이미지마다 다를 수 있습니다.\n\n"
+        "개공율은 분자와 분모가 모두 픽셀 크기의 제곱으로 스케일되므로 이 값에 "
+        "거의 영향을 받지 않습니다. 영향을 받는 것은 등가직경·밀도·시야, 그리고 "
+        "최소 등가직경(µm) 필터를 통과하는 객체의 범위입니다.\n\n"
+        "Pore 원형도와 유효 Pore 원형도는 무차원이라 전혀 영향이 없습니다.",
+    "n_objects":
+        "모든 필터를 통과해 형상 지표 계산에 사용된 Pore의 개수입니다.\n\n"
+        "제외되는 것: 등가직경이 최소값 미만인 것, 이미지 경계에 닿은 것.",
+
+    # --- 세 가지 개공율: 전체 = 유효 + 무효 ---
+    "pore_fraction_pct":
+        "검출된 Pore 전체의 면적 합 ÷ 시야 면적 × 100.\n\n"
+        "유효와 무효를 모두 더한 값입니다. 그림자에서 비롯된 무효 Pore가 섞여 "
+        "있으므로, 조건 간 비교에는 아래의 유효 Pore 개공율을 쓰십시오.",
+    "valid_pore_fraction_pct":
+        "주 지표입니다.\n\n"
+        "유효 Pore 원형도(solidity)가 기준값 이상인 Pore들의 면적 합 ÷ 시야 면적 "
+        "× 100.\n\n"
+        "어두운 영역에는 실제로 뚫린 Pore와 표면 그림자가 섞여 있는데, 그림자 "
+        "덩어리는 대체로 오목하므로 solidity 기준으로 걸러냅니다.\n\n"
+        "주의: 임계값과 solidity 기준에 따라 절대값이 크게 움직입니다. 동일 "
+        "설정에서 두 조건을 비교한 대소 관계와 비율만 사용하십시오.",
+    "invalid_pore_fraction_pct":
+        "유효 Pore 원형도가 기준값 미만인 Pore들의 면적 합 ÷ 시야 면적 × 100.\n\n"
+        "무너진 asperity에 가려 오목하게 잘려 나간 개구부와 표면 그림자가 여기 "
+        "들어갑니다. 이 값이 클수록 표면이 폐색되어 있다는 뜻입니다.\n\n"
+        "유효 + 무효 = Pore 개공율 이 항상 성립하므로 서로 검산됩니다.",
+
+    "dark_area_fraction_pct":
+        "필터를 걸기 전의 Pore 면적입니다.\n\n"
+        "평활 후 이진화 임계값보다 어두운 픽셀의 비율, 즉 이진화 직후의 Pore "
+        "후보 영역입니다. SEM에서 뚫린 구멍은 어둡게 찍히므로 어두운 영역이 곧 "
+        "Pore 후보가 됩니다.\n\n"
+        "여기서 opening, 최소 등가직경, 프레임 접촉 필터를 거치면 Pore 개공율이 "
+        "됩니다. 두 값의 차이가 필터에서 떨어져 나간 양입니다.\n\n"
+        "Pore 면적(필터전) + Non-Pore 면적 = 100 % 입니다.",
+    "non_pore_area_pct":
+        "Pore가 아닌 밝은 영역이 시야에서 차지하는 비율입니다.\n\n"
+        "평활 후 이진화 임계값 이상인 픽셀의 비율, 즉 100 − Pore 면적(필터전) "
+        "입니다.\n\n"
+        "원시 픽셀 비율이라 필터를 거친 위의 개공율 세 값과는 직접 더해지지 "
+        "않습니다. 남는 차이가 필터에서 탈락한 어두운 조각들입니다.",
+
+    "circularity_median":
+        "Pore 원형도 = 4πA / P²  (A: 면적, P: 둘레)\n\n"
+        "완전한 원이면 1, 길쭉하거나 가장자리가 복잡할수록 0에 가까워집니다. "
+        "전체 Pore의 값을 구한 뒤 그 중앙값을 표시합니다.\n\n"
+        "값이 높을수록 개구부가 덜 폐색되어 원래 형태를 유지하고 있음을 "
+        "시사합니다.",
+    "solidity_median":
+        "유효 Pore 원형도 = A / A_convex hull  (볼록 껍질 면적 대비 실제 면적)\n\n"
+        "흔히 solidity라 부르는 값입니다. 1에 가까우면 오목한 결손이 없는 볼록한 "
+        "형태이고, 낮을수록 개구부가 무너진 asperity에 가려져 잘려 나갔음을 "
+        "뜻합니다.\n\n"
+        "유효 Pore와 무효 Pore를 가르는 기준이 바로 이 값입니다.",
+    "eqdiam_median_um":
+        "각 Pore와 같은 면적을 갖는 원의 지름으로 환산한 값의 중앙값입니다.\n\n"
+        "등가직경 = 2 × √(A / π), 픽셀 크기를 곱해 µm로 변환합니다.",
+    "object_density_per_mm2":
+        "Pore 수 ÷ 시야 면적(mm²).\n\n"
+        "시야 면적은 (가로 픽셀 × 픽셀 크기) × (세로 픽셀 × 픽셀 크기)이며, "
+        "크롭된 영역은 제외됩니다.",
+
+    # --- 개수 기준 비율: 유효 + 무효 = 100 % ---
+    "valid_ratio_pct":
+        "유효 Pore 원형도가 기준값 이상인 Pore의 개수 비율입니다.\n\n"
+        "면적이 아니라 개수 기준이며, 100 − 무효 Pore 비율과 같습니다. "
+        "온전한 개구부가 얼마나 흔한지를 나타냅니다.",
+    "concave_ratio_pct":
+        "유효 Pore 원형도가 기준값 미만인 Pore의 개수 비율입니다.\n\n"
+        "면적이 아니라 개수 기준입니다. 폐색된 개구부가 얼마나 흔한지를 "
+        "나타냅니다.",
+
+    "n_rejected_border":
+        "이미지 경계에 닿아 제외된 Pore의 개수입니다.\n\n"
+        "잘린 객체는 둘레와 볼록 껍질이 실제와 달라 원형도를 신뢰할 수 없으므로 "
+        "제외합니다. ('프레임 접촉 객체 제외'를 끄면 포함됩니다.)",
+    "border_area_fraction_pct":
+        "프레임 접촉으로 제외된 Pore들이 차지하던 면적의 비율입니다.\n\n"
+        "큰 Pore일수록 경계에 닿을 확률이 높으므로, 이 값이 크면 개공율은 그만큼 "
+        "과소평가된 상태입니다. 논문에 수치를 쓰실 때 함께 밝히시는 것이 "
+        "정직합니다.\n\n"
+        "비정상적으로 크다면 정보바나 레터박스가 시야에 포함된 것은 아닌지 "
+        "크롭부터 확인하십시오.",
+    "effective_threshold":
+        "이 이미지에 실제로 적용된 이진화 임계값입니다.\n\n"
+        "'고정'에서는 입력하신 값 그대로이고, 'Otsu(이미지별)'에서는 이미지마다 "
+        "다르며, 'Otsu(일괄)'에서는 모든 이미지가 같은 값을 갖습니다.\n\n"
+        "두 조건을 비교하실 때는 이 열의 값이 서로 같은지 반드시 확인하십시오. "
+        "값이 다르면 개공율 차이에 임계값 차이가 섞여 들어갑니다.",
+    "otsu_threshold_ref":
+        "이 이미지 한 장만으로 산출한 Otsu 임계값입니다. 모드가 "
+        "'Otsu(이미지별)'일 때만 실제로 쓰이고, 그 외에는 참고용입니다.\n\n"
+        "설정하신 고정 임계값이 이 값과 크게 다르면, 밝기나 대비가 다른 이미지를 "
+        "같은 고정 임계로 비교하고 있다는 신호입니다. 그럴 때는 '대비 정규화'를 "
+        "켜시거나 'Otsu(일괄)'로 바꾸십시오.",
+}
+
+# ------------------------------------------------------------- 분석 조건 항목
 PARAM_HELP = {
     "pixel_size_um":
         "이미지 한 픽셀이 실제로 몇 µm인지입니다.\n\n"
@@ -115,7 +207,7 @@ PARAM_HELP = {
         "자동으로 읽어 채웁니다(Zeiss·FEI·ImageJ·TIFF 해상도 태그). 메타데이터가 "
         "없는 화면 캡처나 JPEG라면 옆의 '스케일바로 측정' 버튼을 누르고 이미지에 "
         "찍힌 스케일바를 드래그하신 뒤 거기 적힌 길이를 입력하시면 됩니다.\n\n"
-        "면적·등가직경·밀도·개공률이 모두 이 값에 비례합니다. 형상 지표"
+        "등가직경·밀도·시야가 이 값에 비례합니다. 개공율과 형상 지표"
         "(원형도·solidity)는 영향을 받지 않습니다.",
     "sigma_px":
         "이진화 전에 적용하는 가우시안 평활의 표준편차(픽셀)입니다.\n\n"
@@ -131,7 +223,7 @@ PARAM_HELP = {
         "등가직경이 이 값보다 작은 덩어리는 버립니다. 유효 최소 스케일에 해당합니다.\n\n"
         "기본값 2.0 µm는 픽셀 크기 0.404 µm 기준으로 약 5픽셀, 면적으로는 약 19픽셀입니다.",
     "solidity_cut":
-        "개공률 분자에 포함할 볼록도의 하한입니다.\n\n"
+        "유효 Pore로 인정할 유효 Pore 원형도(solidity)의 하한입니다.\n\n"
         "이 값 이상인 객체의 면적만 합산합니다. 낮추면 그림자성 오목 영역이 섞여 "
         "들어오고, 높이면 실제 개구부까지 탈락합니다.",
     "opening_radius_px":
@@ -144,9 +236,10 @@ PARAM_HELP = {
         "놓치거나 과하게 자를 때만 직접 지정하십시오.",
     "crop_top_px":
         "이미지 위쪽에서 잘라낼 행 수입니다. 화면 캡처의 검은 여백(레터박스) 제거용입니다.\n\n"
-        "잘라내지 않으면 그 띠가 시야 면적에 포함되어 개공률이 실제보다 낮게 나옵니다.",
+        "잘라내지 않으면 그 띠가 시야 면적에 포함되어 개공율이 실제보다 낮게 나옵니다.",
 }
 
+# --------------------------------------------------------------- 임계 모드
 THRESHOLD_MODES = [
     ("고정", "fixed"),
     ("Otsu (이미지별)", "otsu"),
@@ -156,7 +249,7 @@ THRESHOLD_MODES = [
 MODE_HELP = (
     "어두운 곳과 밝은 곳을 가르는 기준을 어떻게 정할지입니다.\n\n"
     "• 고정 — 입력하신 임계값을 그대로 씁니다. 촬영 조건이 완전히 동일한 "
-    "이미지들에만 안전합니다. 한쪽이 더 밝게 찍히면 그 차이가 개공률 차이로 "
+    "이미지들에만 안전합니다. 한쪽이 더 밝게 찍히면 그 차이가 개공율 차이로 "
     "둔갑합니다.\n\n"
     "• Otsu (이미지별) — 이미지마다 밝기 분포를 보고 임계값을 따로 정합니다. "
     "밝기 차이는 사라지지만, 조건 간 실제 차이까지 일부 흡수할 수 있습니다.\n\n"
@@ -167,6 +260,7 @@ MODE_HELP = (
     "'권장 설정' 버튼으로 한 번에 맞출 수 있습니다."
 )
 
+# ------------------------------------------------------------------ 체크박스
 CHECK_HELP = {
     "phys":
         "평활 σ와 opening 반경을 픽셀이 아니라 µm로 지정합니다.\n\n"
@@ -176,7 +270,7 @@ CHECK_HELP = {
         "켜시면 입력하신 µm 값을 이미지마다 자기 픽셀 크기로 나누어 픽셀 수를 "
         "구하므로, 배율이 달라도 평활과 opening이 같은 물리적 거리를 덮습니다. "
         "즉 필터가 모든 이미지에서 같은 의미를 갖습니다.\n\n"
-        "이것이 보장하는 것은 기준의 일관성이지, 개공률이 반드시 더 가까워진다는 "
+        "이것이 보장하는 것은 기준의 일관성이지, 개공율이 반드시 더 가까워진다는 "
         "뜻은 아닙니다. 실제 차이는 표면과 배율에 따라 달라집니다.",
     "normalize":
         "이미지마다 밝기·대비를 자기 자신의 범위에 맞춰 늘려 편 뒤에 임계를 "
@@ -188,9 +282,9 @@ CHECK_HELP = {
         "조건 간 비율이 2.25배에서 1.73배로 무너졌지만, 이 옵션을 켜면 2.22배로 "
         "돌아왔습니다.",
     "border":
-        "이미지 경계에 닿은 객체를 계산에서 제외합니다.\n\n"
+        "이미지 경계에 닿은 Pore를 계산에서 제외합니다.\n\n"
         "잘린 객체는 둘레와 볼록 껍질이 실제와 달라 형상 지표를 신뢰할 수 없습니다. "
-        "다만 큰 객체일수록 경계에 닿기 쉬우므로, 제외하면 개공률은 과소평가됩니다. "
+        "다만 큰 Pore일수록 경계에 닿기 쉬우므로, 제외하면 개공율은 과소평가됩니다. "
         "제외된 면적 비율은 결과 표의 '접촉면적 %'에서 확인하십시오.",
     "autocrop":
         "이미지 위아래의 단색 띠를 자동으로 찾아 잘라냅니다.\n\n"
@@ -198,6 +292,10 @@ CHECK_HELP = {
         "완전한 흑/백에 가까운 띠만 인정하는 보수적인 판정이라, 실제 패드 표면을 "
         "잘라낼 위험은 낮습니다. 크롭 값을 직접 입력하시면 그쪽이 우선합니다.",
 }
+
+# ############################################################################
+# #             설 명 문 구   끝  —  아래부터는 프로그램 코드입니다           #
+# ############################################################################
 
 
 # --------------------------------------------------------------------------
@@ -276,6 +374,49 @@ def _shrink_overlay(overlay, max_side=PREVIEW_MAX):
     im = Image.fromarray(overlay).resize(
         (max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
     return np.asarray(im)
+
+
+class _Spinner(tk.Canvas):
+    """
+    A small rotating arc that says the program is alive.
+
+    A progress bar answers "how far"; this answers "is it stuck?", which is the
+    question during a step whose length nobody knows. It draws nothing and
+    schedules nothing until it is started.
+    """
+
+    def __init__(self, parent, size=18, color="#2b7de9", width=3):
+        super().__init__(parent, width=size, height=size,
+                         highlightthickness=0, bd=0,
+                         bg=parent.cget("background") if "background" in
+                         parent.keys() else None)
+        self._size = size
+        self._color = color
+        self._width = width
+        self._angle = 0
+        self._job = None
+
+    def start(self, interval=60):
+        if self._job is None:
+            self._tick(interval)
+
+    def stop(self):
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+        self.delete("all")
+
+    def _tick(self, interval):
+        self.delete("all")
+        pad = self._width
+        self.create_arc(pad, pad, self._size - pad, self._size - pad,
+                        start=self._angle, extent=100, style="arc",
+                        outline=self._color, width=self._width)
+        self._angle = (self._angle - 18) % 360
+        self._job = self.after(interval, lambda: self._tick(interval))
 
 
 def attach_tip(widget, tooltip: Tooltip, text, key=None):
@@ -504,7 +645,7 @@ class App:
         b_sweep.pack(side="left", padx=4)
         attach_tip(b_sweep, self.tip,
                    "선택한 이미지에 대해 이진화 임계 0.35–0.65 × solidity 기준 "
-                   "0.85–0.95의 21개 조합으로 개공률을 다시 계산합니다.\n\n"
+                   "0.85–0.95의 21개 조합으로 유효 Pore 개공율을 다시 계산합니다.\n\n"
                    "절대값이 얼마나 움직이는지, 그리고 두 조건을 비교했을 때 "
                    "대소 관계가 뒤집히지 않는지 확인하는 용도입니다.",
                    key="btn:sweep")
@@ -532,9 +673,9 @@ class App:
         holder.pack_propagate(False)
         holder.pack(side="top", fill="both", expand=True)
 
-        self.tree = ttk.Treeview(holder, columns=[c[0] for c in COLS],
+        self.tree = ttk.Treeview(holder, columns=[c[0] for c in COLUMNS],
                                  show="headings", height=10)
-        for key, title, wdt, _desc in COLS:
+        for key, title, wdt in COLUMNS:
             self.tree.heading(key, text=title)
             self.tree.column(key, width=wdt, anchor="center", stretch=False)
         self.tree.column("file", anchor="w")
@@ -554,18 +695,18 @@ class App:
         self.lbl_sub = ttk.Label(vbox, text="", style="Hint.TLabel", justify="left",
                                  wraplength=PANEL_W - 10)
         self.lbl_sub.pack(side="bottom", anchor="w", fill="x")
-        self.lbl_big = ttk.Label(vbox, text="개공률 —", style="Big.TLabel")
+        self.lbl_big = ttk.Label(vbox, text="유효 Pore 개공율 —", style="Big.TLabel")
         self.lbl_big.pack(side="bottom", anchor="w", pady=(6, 2))
 
         legend = ttk.Frame(vbox)
         legend.pack(side="bottom", anchor="w", fill="x", pady=(8, 2))
-        self._legend_swatch(legend, CONVEX, "볼록 개구부 — 개공률에 포함",
-                            "Solidity가 기준값 이상인 객체입니다. 이 객체들의 면적 합이 "
-                            "개공률의 분자가 됩니다.")
-        self._legend_swatch(legend, CONCAVE, "오목·폐색 — 개공률에서 제외",
-                            "Solidity가 기준값 미만인 객체입니다. 무너진 asperity에 가려진 "
-                            "개구부나 표면 그림자가 대부분이라 분자에서 뺍니다.\n\n"
-                            "필터에서 탈락한 객체(너무 작거나 경계에 닿은 것)는 아예 "
+        self._legend_swatch(legend, CONVEX, "유효 Pore — 개공율에 포함",
+                            "유효 Pore 원형도(solidity)가 기준값 이상인 Pore입니다. 이들의 면적 합이 "
+                            "유효 Pore 개공율의 분자가 됩니다.")
+        self._legend_swatch(legend, CONCAVE, "무효 Pore — 유효 개공율에서 제외",
+                            "유효 Pore 원형도가 기준값 미만인 Pore입니다. 무너진 asperity에 가려진 "
+                            "개구부나 표면 그림자가 대부분이라 유효 개공율에서 뺍니다.\n\n"
+                            "필터에서 탈락한 것(너무 작거나 경계에 닿은 것)은 아예 "
                             "칠해지지 않습니다.")
 
         # The canvas's requested width is what sets this panel's width. Labels
@@ -575,8 +716,15 @@ class App:
                                 highlightthickness=0)
         self.canvas.pack(side="top", fill="both", expand=True)
 
-        # ---- status -----------------------------------------------------
+        # ---- status + progress ------------------------------------------
+        srow = ttk.Frame(outer)
+        srow.pack(fill="x", pady=(6, 0))
+        # Determinate while images are being analysed (we know the count) and
+        # indeterminate during the pooled-Otsu pass, whose length is unknown.
+        self.progress = ttk.Progressbar(srow, mode="determinate", length=190)
+        self.spinner = _Spinner(srow, size=18)
         self.status = ttk.Label(outer, text="대기 중", style="Hint.TLabel", anchor="w")
+        self.srow = srow
         self.status.pack(fill="x", pady=(6, 0))
 
     def _update_unit_labels(self):
@@ -649,7 +797,7 @@ class App:
         if len(scales) > 1:
             lo, hi = min(scales), max(scales)
             parts.append(f"배율 혼재: 픽셀 크기가 {lo:.4g}–{hi:.4g} µm/px로 다릅니다"
-                         f" ({len(scales)}종). 개공률 자체는 배율에 불변이지만, "
+                         f" ({len(scales)}종). 개공율 자체는 배율에 불변이지만, "
                          f"σ·opening을 µm로 지정하셔야 물리적 기준이 같아집니다.")
         if unknown:
             parts.append(f"{len(unknown)}개 이미지는 픽셀 크기를 모릅니다 — "
@@ -759,10 +907,11 @@ class App:
             i = int(col.lstrip("#")) - 1
         except ValueError:
             return
-        if not (0 <= i < len(COLS)):
+        if not (0 <= i < len(COLUMNS)):
             return
-        key, title, _w, desc = COLS[i]
-        self.tip.request(f"col:{key}", f"{title}\n\n{desc}",
+        key, title, _w = COLUMNS[i]
+        desc = COL_HELP.get(key, "")
+        self.tip.request(f"col:{key}", f"{title}\n\n{desc}" if desc else title,
                          event.x_root + 12, event.y_root + 20)
 
     # ------------------------------------------------------------- files
@@ -815,7 +964,7 @@ class App:
         self.flist.delete(*self.flist.get_children())
         self._refresh_table()
         self.canvas.delete("all")
-        self.lbl_big.config(text="개공률 —")
+        self.lbl_big.config(text="유효 Pore 개공율 —")
         self.lbl_sub.config(text="")
         self.lbl_mixed.config(text="")
         self.lbl_px_src.config(text="")
@@ -864,6 +1013,7 @@ class App:
         self._busy = True
         self._failures = []
         self.btn_run.config(state="disabled")
+        self._show_busy(True)
         # Read every Tk variable here, on the main thread. Tkinter is not
         # thread-safe: touching a Tk variable from the worker deadlocks Tcl.
         autocrop = self.var_autocrop.get()
@@ -901,6 +1051,7 @@ class App:
                         yield load_gray(path, pp.crop_bottom_px, pp.crop_top_px)
                     except Exception:
                         continue
+            self._q.put(("progress", (None, None)))     # unknown length
             forced = pooled_otsu(grays(), p)
             if forced == forced:                      # not NaN
                 self._q.put(("status",
@@ -913,6 +1064,7 @@ class App:
         # Pass 3: analyse
         for i, (path, pp) in enumerate(plans, 1):
             try:
+                self._q.put(("progress", (i - 1, len(plans))))
                 self._q.put(("status",
                              f"[{i}/{len(plans)}] {labels.get(path, os.path.basename(path))} "
                              f"분석 중…"))
@@ -930,6 +1082,7 @@ class App:
                 self._q.put(("result", (path, res, pp)))
             except Exception:
                 self._q.put(("error", (path, traceback.format_exc(limit=3))))
+        self._q.put(("progress", (len(plans), len(plans))))
         self._q.put(("done", None))
 
     def _drain_queue(self):
@@ -938,6 +1091,16 @@ class App:
                 kind, payload = self._q.get_nowait()
                 if kind == "status":
                     self.status.config(text=payload)
+                elif kind == "progress":
+                    done, total = payload
+                    if total and done is not None:      # per-image step
+                        self.spinner.stop()
+                        self.progress.config(mode="determinate", maximum=total,
+                                             value=done)
+                    else:                               # unknown-length step
+                        self.progress.config(mode="indeterminate")
+                        self.progress.start(14)
+                        self.spinner.start()
                 elif kind == "result":
                     path, res, used = payload
                     res.used_params = used
@@ -954,11 +1117,28 @@ class App:
                 elif kind == "done":
                     self._busy = False
                     self.btn_run.config(state="normal")
+                    self._show_busy(False)
                     self._report_failures()
                     self._show_preview()
         except queue.Empty:
             pass
         self.root.after(80, self._drain_queue)
+
+    def _show_busy(self, busy: bool):
+        """Put the progress bar and spinner on screen only while working."""
+        if busy:
+            self.spinner.pack(side="left", padx=(0, 6))
+            self.progress.pack(side="left")
+            self.progress.config(mode="indeterminate", value=0)
+            self.progress.start(14)
+            self.spinner.start()
+            self.btn_run.config(text="분석 중…")
+        else:
+            self.progress.stop()
+            self.spinner.stop()
+            self.progress.pack_forget()
+            self.spinner.pack_forget()
+            self.btn_run.config(text="분석 실행")
 
     def _report_failures(self):
         """One summary at the end, rather than a dialog per failed file."""
@@ -1000,12 +1180,12 @@ class App:
         win.title(f"강건성 스윕 — {os.path.basename(sel)}")
         win.geometry("540x470")
         ttk.Label(win, padding=8, justify="left", wraplength=510,
-                  text=("임계 0.35–0.65 × solidity 0.85–0.95 조합별 개공률입니다. "
+                  text=("임계 0.35–0.65 × solidity 0.85–0.95 조합별 유효 Pore 개공율입니다. "
                         "절대값은 크게 변하므로 두 조건을 동일 설정에서 비교한 "
                         "대소 관계만 사용하십시오.")).pack(fill="x")
         tv = ttk.Treeview(win, columns=("t", "s", "f", "n"), show="headings")
         for k, t, w in (("t", "임계", 95), ("s", "Solidity", 95),
-                        ("f", "개공률 %", 115), ("n", "객체수", 95)):
+                        ("f", "유효 Pore 개공율 %", 130), ("n", "Pore 수", 95)):
             tv.heading(k, text=t)
             tv.column(k, width=w, anchor="center")
         tv.pack(fill="both", expand=True, padx=8, pady=8)
@@ -1034,7 +1214,7 @@ class App:
                 continue
             row = res.summary_row()
             self.tree.insert("", "end", iid=path,
-                             values=[row.get(c[0], "") for c in COLS])
+                             values=[row.get(c[0], "") for c in COLUMNS])
 
     def _selected_path(self):
         sel = self.tree.selection()
@@ -1081,17 +1261,22 @@ class App:
             mode_note = (f"임계 {res.effective_threshold:.4f} "
                          f"({label}{norm}) · 이 이미지의 Otsu {res.otsu_threshold:.3f}\n")
 
-        self.lbl_big.config(text=f"개공률 {100*res.open_pore_fraction:.2f} %")
+        self.lbl_big.config(text=f"유효 Pore 개공율 {100*res.open_pore_fraction:.2f} %")
         self.lbl_sub.config(text=(
-            f"객체 {res.n_objects}개 · 원형도 중앙값 {res.circularity_median:.3f} · "
-            f"Solidity 중앙값 {res.solidity_median:.3f}\n"
+            f"Pore 개공율 {100*res.total_pore_fraction:.2f} % = "
+            f"유효 {100*res.open_pore_fraction:.2f} % + "
+            f"무효 {100*res.invalid_pore_fraction:.2f} %\n"
+            f"Pore {res.n_objects}개 · 유효 {100*res.valid_count_ratio:.0f} % · "
+            f"Pore 원형도 {res.circularity_median:.3f} · "
+            f"유효 Pore 원형도 {res.solidity_median:.3f}\n"
             f"시야 {res.field_w_um:.0f} × {res.field_h_um:.0f} µm "
             f"({res.width_px} × {res.height_px} px)\n"
             f"{mode_note}"
             f"{crop_note}"
-            f"단순 암부면적률 {100*res.dark_area_fraction:.1f} % — 그림자 포함, 참고용\n"
+            f"Pore 면적(필터전) {100*res.dark_area_fraction:.1f} % · "
+            f"Non-Pore 면적 {100*(1-res.dark_area_fraction):.1f} %\n"
             f"프레임 접촉 제외 {res.n_rejected_border}개 "
-            f"(면적 {100*res.border_area_fraction:.1f} %) — 개공률은 그만큼 과소평가"))
+            f"(면적 {100*res.border_area_fraction:.1f} %) — 개공율은 그만큼 과소평가"))
 
     # -------------------------------------------------------------- save
     def _save_csv(self):

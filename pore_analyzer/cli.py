@@ -18,7 +18,7 @@ from .pixelsize import read_pixel_size, format_pixel_size
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="pore-analyzer",
-        description="CMP pad SEM 이미지의 개공률(open-pore fraction)을 산출합니다.")
+        description="CMP pad SEM 이미지의 유효 Pore 개공율(open-pore fraction)을 산출합니다.")
     ap.add_argument("images", nargs="+", help="이미지 파일 또는 glob 패턴")
     ap.add_argument("--pixel-size", type=float, default=0.404, help="µm/px (기본 0.404)")
     ap.add_argument("--sigma", type=float, default=1.2, help="Gaussian σ, px (기본 1.2)")
@@ -140,18 +140,24 @@ def main(argv=None):
 
         print(f"\n=== {res.source} ===")
         print(f"  시야           {res.field_w_um:.1f} x {res.field_h_um:.1f} µm")
-        print(f"  객체 수        {res.n_objects}  (밀도 {res.object_density_per_mm2:.0f} /mm²)")
+        print(f"  Pore 수        {res.n_objects}  (밀도 {res.object_density_per_mm2:.0f} /mm²)")
         print(f"  픽셀 크기      {p.pixel_size_um:.5g} µm/px")
         print(f"  적용 임계      {res.effective_threshold:.4f}  "
               f"(모드 {p.threshold_mode}"
               f"{', 대비 정규화' if p.normalize_contrast else ''}"
               f", 이 이미지의 Otsu {res.otsu_threshold:.3f})")
-        print(f"  개공률         {100*res.open_pore_fraction:.2f} %   <-- 주 지표")
-        print(f"  단순 암부면적  {100*res.dark_area_fraction:.2f} %   (그림자 포함, 참고용)")
-        print(f"  원형도 중앙값  {res.circularity_median:.3f} "
+        print(f"  유효 Pore 개공율 {100*res.open_pore_fraction:.2f} %   <-- 주 지표")
+        print(f"  Pore 개공율    {100*res.total_pore_fraction:.2f} % "
+              f"(= 유효 {100*res.open_pore_fraction:.2f} + "
+              f"무효 {100*res.invalid_pore_fraction:.2f})")
+        print(f"  Pore 면적(필터전) {100*res.dark_area_fraction:.2f} %   "
+              f"(Non-Pore 면적 {100*(1-res.dark_area_fraction):.2f} %)")
+        print(f"  Pore 원형도    {res.circularity_median:.3f} "
               f"(IQR {res.circularity_q1:.3f}–{res.circularity_q3:.3f})")
-        print(f"  Solidity 중앙값 {res.solidity_median:.3f} "
+        print(f"  유효 Pore 원형도 {res.solidity_median:.3f} "
               f"(IQR {res.solidity_q1:.3f}–{res.solidity_q3:.3f})")
+        print(f"  유효/무효 Pore 비율 {100*res.valid_count_ratio:.1f} % / "
+              f"{100*res.concave_ratio:.1f} %  (개수 기준)")
         print(f"  등가직경 중앙값 {res.eqdiam_median_um:.2f} µm")
         print(f"  제외: 소형 {res.n_rejected_small}, 프레임접촉 {res.n_rejected_border} "
               f"(면적 {100*res.border_area_fraction:.1f} %)")
@@ -166,7 +172,7 @@ def main(argv=None):
             print(f"  오버레이 저장  {out}")
 
         if args.sweep:
-            print("  --- 강건성 스윕 (임계 x solidity -> 개공률 %) ---")
+            print("  --- 강건성 스윕 (임계 x solidity -> 유효 Pore 개공율 %) ---")
             for r in robustness_sweep(load_gray(path, p.crop_bottom_px, p.crop_top_px), p):
                 print(f"    thr={r['threshold']:.2f}  S={r['solidity_cut']:.2f}  "
                       f"{r['open_pore_fraction_pct']:6.2f} %   n={r['n_objects']}")

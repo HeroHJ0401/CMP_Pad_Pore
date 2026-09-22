@@ -128,6 +128,32 @@ def main():
     checks.append(("per-image scale is recorded in the result",
                    analyze_array(gray, Params(pixel_size_um=0.202)).pixel_size_um == 0.202))
 
+    # ---- the three area fractions must partition the pore area ------------
+    # Pore = 유효 + 무효. If this ever drifts the table is quietly lying, so it
+    # is checked exactly rather than to a tolerance.
+    checks.append(("total pore area = valid + invalid",
+                   abs(res.total_pore_fraction
+                       - (res.open_pore_fraction + res.invalid_pore_fraction)) < 1e-12))
+    checks.append(("valid area is the published metric",
+                   res.open_pore_fraction <= res.total_pore_fraction + 1e-12))
+    checks.append(("count ratios sum to one",
+                   abs(res.valid_count_ratio + res.concave_ratio - 1.0) < 1e-12))
+
+    row = res.summary_row()
+    checks.append(("CSV carries all three area fractions",
+                   abs(row["valid_pore_fraction_pct"] + row["invalid_pore_fraction_pct"]
+                       - row["pore_fraction_pct"]) < 0.02))
+    checks.append(("non-pore is the complement of the dark area",
+                   abs(row["non_pore_area_pct"] + row["dark_area_fraction_pct"]
+                       - 100.0) < 1e-9))
+
+    # an image with no objects at all must not divide by zero
+    blank = np.full_like(gray, 0.9)
+    res_blank = analyze_array(blank, p, source="blank")
+    checks.append(("empty image is handled",
+                   res_blank.n_objects == 0 and res_blank.open_pore_fraction == 0.0
+                   and res_blank.total_pore_fraction == 0.0))
+
     # ---- labels must stay unique across folders ---------------------------
     import os as _os
     clash = [_os.path.join("x", "cond_A", "site01.tif"),

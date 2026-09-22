@@ -68,17 +68,24 @@ jobs:
 
       - name: Build
         shell: bash
-        run: >
-          pyinstaller --noconfirm --clean --onefile --windowed
-          --name CMP_PoreAnalyzer
-          --osx-bundle-identifier com.cmp.poreanalyzer
-          --collect-all skimage
-          --collect-all tkinterdnd2
-          --hidden-import PIL._tkinter_finder
-          --exclude-module matplotlib
-          --exclude-module pytest
-          --exclude-module IPython
-          main.py
+        run: |
+          # PyInstaller's splash covers the seconds a onefile build spends
+          # unpacking itself, before Python starts. It is Windows/Linux only:
+          # passing it on macOS fails the build, so it is added per-OS.
+          ARGS=(--noconfirm --clean --onefile --windowed
+                --name CMP_PoreAnalyzer
+                --osx-bundle-identifier com.cmp.poreanalyzer
+                --collect-all skimage
+                --collect-all tkinterdnd2
+                --hidden-import PIL._tkinter_finder
+                --exclude-module matplotlib
+                --exclude-module pytest
+                --exclude-module IPython)
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ARGS+=(--splash splash.png)
+          fi
+          echo "pyinstaller ${ARGS[*]} main.py"
+          pyinstaller "${ARGS[@]}" main.py
 
       # `timeout` matters: a windowed build that hits an unhandled error pops a
       # modal dialog nobody can dismiss on a runner, and the step would hang
