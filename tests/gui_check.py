@@ -232,6 +232,128 @@ def main():
     check("이미지가 없다는 안내를 띄운다",
           any("클립보드" in t for _k, t, _m in DIALOGS), str(DIALOGS[-1:]))
 
+    # ------------------------------------------------- paste key recognition
+    # The reported bug: the button worked, Ctrl+V did nothing. With a Hangul
+    # layout active Tk reports the keysym of the character the layout produces,
+    # so a <Control-v> binding never matches. Match on the hardware key code.
+    print("\n붙여넣기 키 인식")
+    def ev(**kw):
+        e = type("E", (), {})()
+        e.keysym = kw.get("keysym", "")
+        e.keycode = kw.get("keycode", 0)
+        return e
+
+    check("영문 자판의 v를 받는다", app._looks_like_paste(ev(keysym="v", keycode=86)))
+    check("한글 자판이라 keysym이 달라도 키코드로 받는다",
+          app._looks_like_paste(ev(keysym="ㅍ", keycode=86)))
+    check("맥 키코드도 받는다", app._looks_like_paste(ev(keysym="ㅍ", keycode=9)))
+    check("<<Paste>> 가상 이벤트를 받는다", app._looks_like_paste(ev(keysym="??")))
+    check("Ctrl+C 같은 다른 조합은 무시한다",
+          not app._looks_like_paste(ev(keysym="c", keycode=67)))
+    check("Ctrl+A 도 무시한다", not app._looks_like_paste(ev(keysym="a", keycode=65)))
+
+    IG.grabclipboard = lambda: bitmap
+    app.flist.focus_set()
+    pump(root, 3)
+    app._last_paste_ms = 0.0
+    n3 = len(app.files)
+    app._on_paste_event(ev(keysym="ㅍ", keycode=86))
+    pump(root, 3)
+    check("한글 자판 키 이벤트로 실제로 붙여넣어진다",
+          len(app.files) == n3 + 1, f"{n3} -> {len(app.files)}")
+    # the overlapping bindings all fire for one keystroke; only one may act
+    n4 = len(app.files)
+    app._on_paste_event(ev(keysym="v", keycode=86))
+    app._on_paste_event(ev(keysym="??"))
+    pump(root, 3)
+    check("겹치는 바인딩이 여러 번 붙여넣지 않는다",
+          len(app.files) == n4, f"{n4} -> {len(app.files)}")
+
+    # ---------------------------------------------------------- split option
+    print("\n객체화 방식")
+    app.var_objectify.set("거리 분할")
+    app.v["split_depth_um"].set("2.5")
+    p = app._params()
+    check("거리 분할이 분석 조건으로 전달된다",
+          p.objectify == "distance" and abs(p.split_depth_um - 2.5) < 1e-9,
+          f"{p.objectify}, {p.split_depth_um}")
+    app.var_objectify.set("지형 분할")
+    app.v["terrain_depth"].set("0.06")
+    p = app._params()
+    check("지형 분할도 전달된다",
+          p.objectify == "terrain" and abs(p.terrain_depth - 0.06) < 1e-9,
+          f"{p.objectify}, {p.terrain_depth}")
+    app.var_objectify.set("연결 성분")
+    check("되돌리면 연결 성분", app._params().objectify == "cc")
+
+    # the depth is a judgement made by eye, so the picker has to actually run
+    # the image at several depths and write the chosen one back
+    print("\n지형 깊이 비교 창")
+    app.tree.selection_set(good)
+    pump(root, 3)
+    app.v["terrain_depth"].set("0.08")
+    before = len(root.winfo_children())
+    app._compare_terrain()
+    pump(root, 6)
+    wins = [w for w in root.winfo_children() if isinstance(w, tk.Toplevel)]
+    check("비교 창이 뜬다", len(wins) >= 1, f"{before} -> {len(root.winfo_children())}")
+    if wins:
+        win = wins[-1]
+        btns = []
+
+        def walk(w):
+            for ch in w.winfo_children():
+                if isinstance(ch, ttk.Button) and ch.cget("text") in (
+                        "전체에 적용", "이 이미지만"):
+                    btns.append((str(ch.cget("text")), ch))
+                walk(ch)
+        walk(win)
+        check("깊이마다 적용 버튼 두 개가 있다", len(btns) >= 10, str(len(btns)))
+        check("썸네일이 살아 있다", len(app._terrain_thumbs) >= 5,
+              str(len(app._terrain_thumbs)))
+        one = [b for n, b in btns if n == "이 이미지만"]
+        allb = [b for n, b in btns if n == "전체에 적용"]
+        if allb:
+            allb[0].invoke()
+            pump(root, 4)
+            check("'전체에 적용'이 기본 깊이를 바꾼다",
+                  app._params().objectify == "terrain"
+                  and abs(app._params().terrain_depth - 0.02) < 1e-9
+                  and not app.depth_info,
+                  f"{app.v['terrain_depth'].get()}, per-image={app.depth_info}")
+        # reopen and take the per-image branch
+        app._compare_terrain()
+        pump(root, 6)
+        wins2 = [w for w in root.winfo_children() if isinstance(w, tk.Toplevel)]
+        btns2 = []
+        def walk2(w):
+            for ch in w.winfo_children():
+                if isinstance(ch, ttk.Button) and ch.cget("text") == "이 이미지만":
+                    btns2.append(ch)
+                walk2(ch)
+        if wins2:
+            walk2(wins2[-1])
+        if btns2:
+            btns2[-1].invoke()
+            pump(root, 4)
+            check("'이 이미지만'은 그 파일에만 붙는다",
+                  good in app.depth_info
+                  and abs(app._depth_for(good) - app.depth_info[good]) < 1e-9
+                  and abs(app._default_depth() - 0.02) < 1e-9,
+                  f"{app.depth_info}")
+            check("다른 이미지는 기본값을 그대로 쓴다",
+                  abs(app._depth_for(empty) - app._default_depth()) < 1e-9)
+            app._check_mixed_scales()
+            pump(root, 3)
+            check("깊이가 섞이면 경고가 뜬다",
+                  "지형 깊이 혼재" in app.lbl_mixed.cget("text"),
+                  app.lbl_mixed.cget("text")[:60])
+            app.depth_info.clear()
+        for w in [x for x in root.winfo_children() if isinstance(x, tk.Toplevel)]:
+            w.destroy()
+        pump(root, 3)
+    app.var_objectify.set("연결 성분")
+
     # ------------------------------------------------------------ tooltips
     print("\n열 머리글 툴팁")
     shown = {}

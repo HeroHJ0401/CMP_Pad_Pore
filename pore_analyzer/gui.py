@@ -15,6 +15,7 @@ import csv
 import atexit
 import shutil
 import tempfile
+import time
 import threading
 import traceback
 import queue
@@ -40,6 +41,8 @@ IMAGE_EXT = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
 CONVEX = "#2ecc71"      # solidity >= cut  -> counted in the open-pore fraction
 CONCAVE = "#e74c3c"     # solidity <  cut  -> excluded
+DROP_BORDER = "#3498db"   # dropped: the object reaches the frame
+DROP_SMALL = "#9b59b6"    # dropped: under the minimum equivalent diameter
 PANEL_W = 460           # preview panel width; also the label wrap width
 APP_NAME = "CMP Pad 개공율 분석기_정현진"
 
@@ -70,9 +73,14 @@ COLUMNS = [
     ("concave_ratio_pct",         "무효 Pore 비율 %",  104),
     ("n_rejected_border",         "프레임접촉",         80),
     ("border_area_fraction_pct",  "접촉면적 %",         88),
+    ("dropped_border_pct",        "탈락-접촉 %",        92),
+    ("dropped_small_pct",         "탈락-소형 %",        92),
+    ("n_blobs_before_split",      "덩어리 수",          80),
+    ("split_gain",                "분리 증가",          80),
     ("effective_threshold",       "적용 임계",          78),
     ("threshold_source",          "임계 출처",          104),
     ("otsu_threshold_ref",        "Otsu(참고)",         84),
+    ("otsu3_threshold_ref",       "Otsu3(참고)",        90),
     ("separability",              "밝기 분리도",        88),
     ("dynamic_range",             "동적 범위",          80),
     ("gray_levels",               "계조 수",            68),
@@ -198,12 +206,56 @@ COL_HELP = {
         "다르며, 'Otsu(일괄)'에서는 모든 이미지가 같은 값을 갖습니다.\n\n"
         "두 조건을 비교하실 때는 이 열의 값이 서로 같은지 반드시 확인하십시오. "
         "값이 다르면 개공율 차이에 임계값 차이가 섞여 들어갑니다.",
+    "otsu3_threshold_ref":
+        "이 이미지 한 장으로 산출한 **3계급 Otsu의 낮은 쪽** 임계값입니다. "
+        "모드가 'Otsu 3계급'일 때 실제로 쓰이고, 그 외에는 참고용입니다.\n\n"
+        "옆의 'Otsu(참고)'와 크게 벌어져 있으면, 이 이미지의 밝기가 두 무리가 "
+        "아니라 세 무리(깊은 Pore / 중간 회색 그림자 / 밝은 기지)라는 뜻입니다. "
+        "실제 패드 이미지에서 2계급은 0.486, 3계급 낮은 쪽은 0.359였고, 눈으로 "
+        "맞춘 값은 0.34였습니다.\n\n"
+        "'밝기 분리도'가 0.70 아래인데 이 두 값이 벌어져 있다면 3계급 모드를 "
+        "먼저 시도해 보십시오.",
+
     "otsu_threshold_ref":
         "이 이미지 한 장만으로 산출한 Otsu 임계값입니다. 모드가 "
         "'Otsu(이미지별)'일 때만 실제로 쓰이고, 그 외에는 참고용입니다.\n\n"
         "설정하신 고정 임계값이 이 값과 크게 다르면, 밝기나 대비가 다른 이미지를 "
         "같은 고정 임계로 비교하고 있다는 신호입니다. 그럴 때는 '대비 정규화'를 "
         "켜시거나 'Otsu(일괄)'로 바꾸십시오.",
+
+    "dropped_border_pct":
+        "프레임에 닿아 계산에서 완전히 빠진 면적의 비율입니다. 오버레이의 "
+        "**파란색**이 이것입니다.\n\n"
+        "탈락 사유는 둘뿐이고(이 열과 옆의 '탈락-소형 %'), 둘 다 solidity와는 "
+        "무관합니다. solidity가 낮은 것은 버려지지 않고 빨간색(무효)이 되며 "
+        "'Pore 개공율'에는 그대로 들어갑니다.\n\n"
+        "이 값이 크면 '눈에는 Pore가 보이는데 못 잡는다'처럼 보입니다. 실제로는 "
+        "잡았는데 버린 것입니다. 실제 SEM 이미지에서 40.7 %가 나온 적이 있는데, "
+        "그림자 다리로 이어진 덩어리 하나가 시야의 19.7 %를 차지하며 왼쪽 변에서 "
+        "한가운데까지 뻗어 통째로 버려진 경우였습니다. 화면 가운데가 파래도 "
+        "같은 색으로 가장자리까지 이어져 있으면 한 객체입니다.\n\n"
+        "대처: '붙은 Pore 분리'로 덩어리를 쪼개거나, 임계값을 낮춰 그림자 다리를 "
+        "끊거나, 정보바가 시야에 들어와 있지 않은지 확인하십시오.",
+
+    "dropped_small_pct":
+        "등가직경이 '최소 등가직경'보다 작아 계산에서 빠진 면적의 비율입니다. "
+        "오버레이의 **보라색**이 이것입니다.\n\n"
+        "면적이 π × (최소 등가직경 ÷ 픽셀 크기 ÷ 2)² 픽셀보다 작으면 해당합니다. "
+        "가우시안 평활과 opening을 거친 뒤에 판정하므로, 잔점은 이 단계에 "
+        "오기도 전에 opening에서 지워집니다.\n\n"
+        "이 값이 크면 최소 등가직경을 낮추시거나 픽셀 크기가 맞는지 확인하십시오. "
+        "개공율에 픽셀 크기가 영향을 주는 경로는 이 필터 하나뿐입니다.",
+
+    "n_blobs_before_split":
+        "이진화 결과에서 서로 이어진 암부 덩어리의 개수입니다(분리 전).\n\n"
+        "눈에 보이는 Pore 수보다 훨씬 적다면 여러 Pore가 그림자 다리로 하나에 "
+        "붙어버린 것입니다. 그렇게 붙은 덩어리는 오목해져서 무효로 분류되고, "
+        "프레임에 닿으면 통째로 탈락합니다.",
+
+    "split_gain":
+        "'Pore 분리'로 덩어리가 몇 개 더 쪼개졌는지입니다(분리 후 − 분리 전).\n\n"
+        "0이면 분리가 꺼져 있거나 쪼갤 것이 없었다는 뜻입니다. 값이 크면 원래 "
+        "이미지에서 Pore들이 그만큼 서로 붙어 있었다는 뜻입니다.",
 
     "threshold_source":
         "'적용 임계' 값이 어디서 나온 것인지입니다.\n\n"
@@ -283,13 +335,50 @@ PARAM_HELP = {
     "crop_top_px":
         "이미지 위쪽에서 잘라낼 행 수입니다. 화면 캡처의 검은 여백(레터박스) 제거용입니다.\n\n"
         "잘라내지 않으면 그 띠가 시야 면적에 포함되어 개공율이 실제보다 낮게 나옵니다.",
+    "split_depth_um":
+        "붙은 Pore를 쪼갤 때의 기준 깊이입니다(µm). 'Pore 분리'를 켜야 쓰입니다.\n\n"
+        "어떤 덩어리 안의 한 봉우리가 자기를 이웃과 잇는 목보다 이 값만큼 더 깊어야 "
+        "독립된 Pore로 셉니다. 작게 하면 잘게 쪼개지고, 크게 하면 웬만해선 붙은 채로 "
+        "둡니다.\n\n"
+        "µm로 지정하므로 배율이 달라도 같은 물리적 기준이 됩니다.\n\n"
+        "절대값에 미치는 영향이 큽니다. 같은 이미지에서 0.5 µm면 유효 개공율 19 %, "
+        "2 µm면 10 %였습니다. 조건 비교에서는 양쪽에 같은 값을 쓰셔야 합니다.",
 }
+
+# ------------------------------------------------------------ 객체화 방식
+OBJECTIFY_MODES = [
+    ("연결 성분", "cc"),
+    ("거리 분할", "distance"),
+    ("지형 분할", "terrain"),
+]
+
+OBJECTIFY_HELP = (
+    "어두운 픽셀을 어떻게 '하나의 Pore'로 묶을지입니다. 임계값과는 별개의 "
+    "결정이고, 이 둘을 한 덩어리로 묶어 둔 것이 문제였습니다.\n\n"
+    "• 연결 성분 — 이진화 마스크에서 서로 이어진 픽셀을 한 객체로 봅니다. "
+    "가장 단순하지만 임계값에 완전히 종속됩니다. 임계가 조금만 높아 Pore 사이 "
+    "회색이 암부에 들어오면 수십 개가 한 덩어리가 됩니다. 실제 이미지에서 "
+    "덩어리 하나가 시야의 19.7 %를 차지했습니다.\n\n"
+    "• 거리 분할 — 마스크의 모양만 보고 목이 좁은 곳을 자릅니다. 좁은 목에는 "
+    "듣지만 넓은 회색으로 이어진 경우에는 듣지 않습니다. 같은 이미지에서 최대 "
+    "객체가 1.5 %까지만 내려갔습니다.\n\n"
+    "• 지형 분할 — 회색 이미지 자체를 지형으로 봅니다. Pore 하나하나가 분지이고, "
+    "'지형 깊이'보다 깊은 웅덩이를 씨앗으로 삼아 물을 채워 능선(리가먼트)에서 "
+    "경계를 긋습니다. 그 능선이 임계값을 넘었는지와 무관합니다. 그래서 임계가 "
+    "나빠도 객체는 제대로 갈라집니다 — 잘못된 2계급 임계를 그대로 두고 이것만 "
+    "바꿨을 때 최대 객체 19.7 % → 0.53 %, 프레임에 삼켜진 면적 40.7 % → 5.1 %였습니다.\n\n"
+    "지형 분할은 객체 수를 크게 늘립니다(같은 이미지에서 182 → 334개). 얕은 "
+    "요철까지 각각 세기 때문입니다. '지형 깊이'로 조절하시고, 밀도와 개수를 "
+    "조건 간 비교에 쓰신다면 같은 값으로 맞추셔야 합니다."
+)
 
 # --------------------------------------------------------------- 임계 모드
 THRESHOLD_MODES = [
     ("고정", "fixed"),
     ("Otsu (이미지별)", "otsu"),
     ("Otsu (일괄)", "otsu_batch"),
+    ("Otsu 3계급 (이미지별)", "otsu3"),
+    ("Otsu 3계급 (일괄)", "otsu3_batch"),
 ]
 
 MODE_HELP = (
@@ -357,6 +446,37 @@ CHECK_HELP = {
         "잘린 객체는 둘레와 볼록 껍질이 실제와 달라 형상 지표를 신뢰할 수 없습니다. "
         "다만 큰 Pore일수록 경계에 닿기 쉬우므로, 제외하면 개공율은 과소평가됩니다. "
         "제외된 면적 비율은 결과 표의 '접촉면적 %'에서 확인하십시오.",
+    "terrain_depth":
+        "지형 분할에서 '이만큼은 깊어야 독립된 Pore'라고 볼 기준입니다. 밝기 "
+        "단위(0~1)이고, 길이가 아니므로 µm가 아닙니다.\n\n"
+        "어떤 웅덩이가 자기를 이웃과 가르는 능선보다 이 값만큼 낮아야 따로 셉니다. "
+        "작게 하면 얕은 요철까지 각각 Pore가 되고, 크게 하면 웬만해선 한 덩어리로 "
+        "둡니다. 실제 이미지에서 0.02면 421개, 0.10이면 280개였습니다.\n\n"
+        "'객체화'가 '지형 분할'일 때만 쓰입니다.\n\n"
+        "여기 값은 모든 이미지의 기본값입니다. 특정 이미지만 다르게 하시려면 "
+        "'지형 깊이 비교…' 창에서 '이 이미지만'을 누르십시오. 이미지 목록의 "
+        "'지형깊이' 열에 괄호로 표시된 값은 이 기본값을 따르고 있다는 뜻이고, "
+        "괄호 없는 값은 그 이미지에만 따로 지정된 것입니다.\n\n"
+        "대비 정규화를 켜두셨다면 깊이는 촬영 조건이 아니라 표면의 성질이라 "
+        "한 값으로 배치 전체를 덮는 것이 정상입니다 — 밝기 ±0.10, 대비 0.6~1.4배를 "
+        "흔들어도 같은 깊이가 같은 분할을 냈습니다(정규화를 끄면 대비 0.6배에서 "
+        "유효 개공율이 41 % 무너졌습니다). 깊이를 이미지마다 다르게 하시면 "
+        "'Pore 하나'의 정의가 달라지므로 조건 간 비교가 흔들립니다.",
+    "split_unused":
+        "그림자 다리로 하나에 붙어버린 Pore들을 쪼개 각각의 객체로 만듭니다.\n\n"
+        "거친 표면에서는 asperity 사이 그림자가 가느다란 어두운 다리를 만들어, "
+        "눈으로는 분명히 따로인 Pore들이 이진화 후에 한 덩어리로 이어집니다. "
+        "그렇게 되면 (1) 개별 Pore로 객체화되지 않고, (2) 덩어리가 심하게 오목해져 "
+        "무효로 분류되며, (3) 덩어리가 프레임에 닿으면 통째로 탈락해 화면에서 "
+        "사라집니다. 실제 이미지에서 한 덩어리가 시야를 가로질러 암부의 34 %를 "
+        "차지하고 solidity 0.50으로 나온 적이 있습니다.\n\n"
+        "거리변환의 봉우리에서 물을 채워 목이 가장 좁은 곳에서 자르는 방식"
+        "(watershed)입니다. 오른쪽의 '분리 깊이'가 '옆 봉우리보다 이만큼은 깊어야 "
+        "따로 센다'는 기준입니다.\n\n"
+        "**기본은 꺼져 있습니다.** 무엇을 Pore 하나로 볼지를 바꾸는 옵션이라 "
+        "절대값이 크게 움직입니다(같은 이미지에서 깊이 0.5 µm면 19 %, 2 µm면 10 %). "
+        "비교하실 두 조건에 반드시 같은 설정을 쓰시고, 논문에 쓰실 때는 깊이 값을 "
+        "함께 밝히십시오.",
     "paste":
         "클립보드에 들어 있는 이미지를 바로 불러옵니다. Ctrl+V(맥은 ⌘V)도 "
         "같습니다.\n\n"
@@ -530,6 +650,10 @@ class App:
         self.results: dict[str, object] = {}
         # path -> (um_per_px or None, where it came from)
         self.px_info: dict[str, tuple] = {}
+        # path -> terrain depth chosen for that image, or absent = use the
+        # global value. Same shape as px_info: per-image where the surface
+        # genuinely differs, one value everywhere when it does not.
+        self.depth_info: dict[str, float] = {}
         self.scale_store = ScaleStore()
         self._failures: list = []
         self._preview_img = None
@@ -546,12 +670,22 @@ class App:
         self.v["threshold"].trace_add(
             "write", lambda *_: self._refresh_applied_threshold())
 
-        # Paste is bound on the toplevel, which fires AFTER the Entry class
-        # binding, so text paste into a parameter box still works; the handler
-        # checks where the focus is and steps aside when it is in an entry.
-        for seq in ("<Control-v>", "<Control-V>", "<Command-v>", "<Command-V>"):
+        # Paste bindings fire AFTER the Entry class binding, so text paste into
+        # a parameter box still works; the handler checks where the focus is and
+        # steps aside when it is in an entry.
+        #
+        # Several sequences on purpose. <Control-v> alone did not fire for the
+        # user at all: with a Hangul (or any non-Latin) layout active, Tk
+        # reports the keysym of the character the layout produces, so the
+        # binding never matches. <Control-KeyPress> plus a hardware key-code
+        # test survives that, and <<Paste>> covers whatever gesture the platform
+        # itself calls paste. They overlap, so the handler de-duplicates.
+        self._last_paste_ms = 0.0
+        for seq in ("<<Paste>>", "<Control-v>", "<Control-V>",
+                    "<Command-v>", "<Command-V>",
+                    "<Control-KeyPress>", "<Command-KeyPress>"):
             try:
-                root.bind(seq, self._paste_from_clipboard)
+                root.bind_all(seq, self._on_paste_event, add="+")
             except tk.TclError:
                 pass
 
@@ -605,14 +739,16 @@ class App:
         fholder = tk.Frame(fbox, width=420, height=132)
         fholder.pack_propagate(False)
         fholder.pack(side="left", fill="both", expand=True)
-        self.flist = ttk.Treeview(fholder, columns=("name", "px", "src"),
+        self.flist = ttk.Treeview(fholder, columns=("name", "px", "depth", "src"),
                                   show="headings", height=6, selectmode="extended")
         self.flist.heading("name", text="파일")
         self.flist.heading("px", text="µm/px")
+        self.flist.heading("depth", text="지형깊이")
         self.flist.heading("src", text="출처")
-        self.flist.column("name", width=190, anchor="w", stretch=True)
-        self.flist.column("px", width=78, anchor="center", stretch=False)
-        self.flist.column("src", width=120, anchor="w", stretch=False)
+        self.flist.column("name", width=170, anchor="w", stretch=True)
+        self.flist.column("px", width=70, anchor="center", stretch=False)
+        self.flist.column("depth", width=68, anchor="center", stretch=False)
+        self.flist.column("src", width=110, anchor="w", stretch=False)
         self.flist.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(fholder, orient="vertical", command=self.flist.yview)
         sb.pack(side="left", fill="y")
@@ -655,6 +791,8 @@ class App:
             "opening_radius_px": tk.StringVar(value="2"),
             "crop_top_px": tk.StringVar(value="0"),
             "crop_bottom_px": tk.StringVar(value="0"),
+            "split_depth_um": tk.StringVar(value="1.0"),
+            "terrain_depth": tk.StringVar(value="0.08"),
         }
         rows = [
             ("픽셀 크기 (µm/px)", "pixel_size_um"),
@@ -665,11 +803,13 @@ class App:
             ("Opening 반경 (px)", "opening_radius_px"),
             ("상단 크롭 (px)", "crop_top_px"),
             ("하단 크롭 (px)", "crop_bottom_px"),
+            ("분리 깊이 (µm)", "split_depth_um"),
+            ("지형 깊이 (0–1)", "terrain_depth"),
         ]
         self.param_labels = {}
         self.param_entries = {}
         for i, (label, key) in enumerate(rows):
-            r, c = i % 4, i // 4
+            r, c = i % 5, i // 5
             lab = ttk.Label(pbox, text=label, cursor="question_arrow")
             self.param_labels[key] = lab
             lab.grid(row=r, column=c * 2, sticky="w", padx=(0, 6), pady=2)
@@ -683,7 +823,7 @@ class App:
 
         # pixel size helper, right under the parameter grid
         pbtn = ttk.Frame(pbox)
-        pbtn.grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        pbtn.grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
         b_scale = ttk.Button(pbtn, text="스케일바로 측정…", command=self._measure_scale)
         b_scale.pack(side="left")
         attach_tip(b_scale, self.tip,
@@ -697,7 +837,7 @@ class App:
 
         # threshold mode
         mrow = ttk.Frame(pbox)
-        mrow.grid(row=5, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        mrow.grid(row=6, column=0, columnspan=4, sticky="w", pady=(8, 0))
         lab_mode = ttk.Label(mrow, text="임계 모드", cursor="question_arrow")
         lab_mode.pack(side="left", padx=(0, 6))
         self.var_mode = tk.StringVar(value="고정")
@@ -719,23 +859,40 @@ class App:
         cb3.pack(side="left", padx=(12, 0))
         attach_tip(cb3, self.tip, CHECK_HELP["phys"], key="chk:phys")
 
+        lab_obj = ttk.Label(mrow, text="객체화", cursor="question_arrow")
+        lab_obj.pack(side="left", padx=(14, 6))
+        self.var_objectify = tk.StringVar(value="연결 성분")
+        cmb_obj = ttk.Combobox(mrow, textvariable=self.var_objectify, state="readonly",
+                               width=13, values=[m[0] for m in OBJECTIFY_MODES])
+        cmb_obj.pack(side="left")
+        attach_tip(lab_obj, self.tip, OBJECTIFY_HELP, key="objectify")
+        attach_tip(cmb_obj, self.tip, OBJECTIFY_HELP, key="objectify")
+
         b_reco = ttk.Button(mrow, text="권장 설정", command=self._apply_recommended)
         b_reco.pack(side="left", padx=(12, 0))
         attach_tip(b_reco, self.tip,
                    "조건 간 비교에 가장 안전한 조합으로 맞춥니다: "
-                   "대비 정규화 켬 + Otsu(일괄).\n\n"
-                   "합성 이미지 실험에서 한쪽을 밝고 대비 낮게 찍어도 조건 간 "
-                   "비율이 2.24배로 유지되었습니다. 같은 조건에서 고정 임계는 "
-                   "1.73배까지 무너집니다.\n\n"
-                   "다만 기존 논문 수치(고정 0.45)를 재현하실 때는 '고정'을 "
-                   "쓰셔야 합니다.",
+                   "대비 정규화 켬 + Otsu(일괄) + 지형 분할(깊이 0.08).\n\n"
+                   "임계 쪽 근거 — 합성 이미지에서 한쪽을 밝고 대비 낮게 찍어도 "
+                   "조건 간 비율이 2.24배로 유지되었습니다. 같은 조건에서 고정 "
+                   "임계는 1.73배까지 무너집니다.\n\n"
+                   "객체화 쪽 근거 — 실제 패드 이미지에서 연결 성분은 덩어리 하나가 "
+                   "시야의 19.7 %를 차지하고 40.7 %가 프레임에 삼켜졌지만, 임계를 "
+                   "그대로 두고 지형 분할로 바꾸자 각각 0.53 %와 5.1 %가 "
+                   "되었습니다.\n\n"
+                   "주의 두 가지. 지형 분할은 객체 수를 크게 늘리므로 개수·밀도를 "
+                   "비교하실 때는 '지형 깊이'를 양쪽에 맞추십시오. 그리고 watershed로 "
+                   "잘린 면은 곧은 변이라 solidity가 체계적으로 낮아집니다 — 중앙값이 "
+                   "기준(0.90)에 겹치면 경고가 뜨니 '강건성 스윕'으로 확인하십시오.\n\n"
+                   "기존 논문 수치(고정 0.45 + 연결 성분)를 재현하실 때는 이 버튼을 "
+                   "쓰지 마십시오.",
                    key="btn:reco")
 
         # What threshold is ACTUALLY in force. The entry box above is ignored in
         # the Otsu modes, and without this line the only way to find that out was
         # to run the analysis and read a column at the far right of the table.
         trow = ttk.Frame(pbox)
-        trow.grid(row=6, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        trow.grid(row=7, column=0, columnspan=4, sticky="w", pady=(6, 0))
         self.lbl_thr = ttk.Label(trow, text="", style="Applied.TLabel",
                                  cursor="question_arrow")
         self.lbl_thr.pack(side="left")
@@ -744,20 +901,30 @@ class App:
         self.var_border = tk.BooleanVar(value=True)
         self.var_autocrop = tk.BooleanVar(value=True)
         cb1 = ttk.Checkbutton(pbox, text="프레임 접촉 객체 제외", variable=self.var_border)
-        cb1.grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        cb1.grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
         cb2 = ttk.Checkbutton(pbox, text="위·아래 단색 띠 자동 크롭", variable=self.var_autocrop)
-        cb2.grid(row=7, column=2, columnspan=2, sticky="w", pady=(6, 0))
+        cb2.grid(row=8, column=2, columnspan=2, sticky="w", pady=(6, 0))
         attach_tip(cb1, self.tip, CHECK_HELP["border"], key="chk:border")
         attach_tip(cb2, self.tip, CHECK_HELP["autocrop"], key="chk:autocrop")
 
         abox = ttk.Frame(pbox)
-        abox.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        abox.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         self.btn_run = ttk.Button(abox, text="분석 실행", command=self._run)
         self.btn_run.pack(side="left")
         ttk.Button(abox, text="CSV 저장", command=self._save_csv).pack(side="left", padx=4)
         ttk.Button(abox, text="오버레이 저장", command=self._save_overlay).pack(side="left")
         b_sweep = ttk.Button(abox, text="강건성 스윕", command=self._run_sweep)
         b_sweep.pack(side="left", padx=4)
+        b_terr = ttk.Button(abox, text="지형 깊이 비교…", command=self._compare_terrain)
+        b_terr.pack(side="left")
+        attach_tip(b_terr, self.tip,
+                   "선택한 이미지를 지형 깊이만 바꿔 여러 번 분할해 나란히 보여 "
+                   "드립니다. 마음에 드는 것을 고르시면 그 값이 분석 조건에 "
+                   "들어갑니다.\n\n"
+                   "깊이는 '이만큼은 깊어야 독립된 Pore'라는 기준이라 자동으로 "
+                   "정해지지 않습니다. 표면마다 다르므로 눈으로 고르시는 것이 "
+                   "맞고, 대신 조건 간 비교에서는 양쪽에 같은 값을 쓰셔야 합니다.",
+                   key="btn:terrain")
         attach_tip(b_sweep, self.tip,
                    "선택한 이미지에 대해 이진화 임계 0.35–0.65 × solidity 기준 "
                    "0.85–0.95의 21개 조합으로 유효 Pore 개공율을 다시 계산합니다.\n\n"
@@ -825,9 +992,22 @@ class App:
                             "유효 Pore 개공율의 분자가 됩니다.")
         self._legend_swatch(legend, CONCAVE, "무효 Pore — 유효 개공율에서 제외",
                             "유효 Pore 원형도가 기준값 미만인 Pore입니다. 무너진 asperity에 가려진 "
-                            "개구부나 표면 그림자가 대부분이라 유효 개공율에서 뺍니다.\n\n"
-                            "필터에서 탈락한 것(너무 작거나 경계에 닿은 것)은 아예 "
-                            "칠해지지 않습니다.")
+                            "개구부나 표면 그림자가 대부분이라 유효 개공율에서 뺍니다.")
+        self._legend_swatch(legend, DROP_BORDER, "탈락 — 프레임에 닿아 제외",
+                            "이미지 경계에 닿아 계산에서 완전히 빠진 영역입니다. "
+                            "('프레임 접촉 객체 제외'를 끄면 빠지지 않습니다.)\n\n"
+                            "화면 한가운데가 이 색이어도 놀라지 마십시오. 하나의 객체가 "
+                            "가장자리에서 출발해 안쪽으로 길게 뻗을 수 있습니다. 실제 "
+                            "이미지에서 한 덩어리가 시야의 19.7 %를 차지하며 왼쪽 변에서 "
+                            "한가운데까지 닿은 적이 있습니다. 같은 색으로 이어져 있고 어딘가 "
+                            "가장자리에 닿아 있다면 전부 한 객체입니다.\n\n"
+                            "이 색이 넓으면 '붙은 Pore 분리'를 켜 보시거나, 임계값을 낮춰 "
+                            "그림자 다리를 끊으십시오.")
+        self._legend_swatch(legend, DROP_SMALL, "탈락 — 최소 등가직경 미만",
+                            "등가직경이 '최소 등가직경' 설정보다 작아 제외된 영역입니다.\n\n"
+                            "면적이 π × (최소 등가직경 ÷ 픽셀 크기 ÷ 2)² 픽셀보다 작으면 "
+                            "여기에 해당합니다. 이 색이 많으면 최소 등가직경을 낮추거나 "
+                            "픽셀 크기가 맞는지 확인하십시오.")
 
         # The canvas's requested width is what sets this panel's width. Labels
         # therefore get a FIXED wraplength: deriving it from the panel width
@@ -867,6 +1047,13 @@ class App:
                 except (ValueError, ZeroDivisionError):
                     pass
 
+    def _objectify_key(self) -> str:
+        label = self.var_objectify.get()
+        for name, key in OBJECTIFY_MODES:
+            if name == label:
+                return key
+        return "cc"
+
     def _mode_key(self) -> str:
         label = self.var_mode.get()
         for name, key in THRESHOLD_MODES:
@@ -896,8 +1083,10 @@ class App:
             self.lbl_thr.config(
                 text=f"적용 임계  {self.v['threshold'].get()}  (입력하신 고정값)")
             return
-        name = "Otsu(일괄) — 전체 공통 1개" if mode == "otsu_batch" \
-            else "Otsu(이미지별) — 이미지마다 다름"
+        name = ("Otsu(일괄) — 전체 공통 1개" if mode.endswith("_batch")
+                else "Otsu(이미지별) — 이미지마다 다름")
+        if mode.startswith("otsu3"):
+            name = "3계급 " + name
         if not thrs:
             self.lbl_thr.config(
                 text=f"적용 임계  분석 실행 후 결정 · {name}"
@@ -924,10 +1113,12 @@ class App:
     def _apply_recommended(self):
         self.var_normalize.set(True)
         self.var_mode.set("Otsu (일괄)")
+        self.var_objectify.set("지형 분할")
+        self.v["terrain_depth"].set("0.08")
         self._on_mode_change()
         self.status.config(
-            text="권장 설정 적용: 대비 정규화 + Otsu(일괄). "
-                 "모든 이미지에 같은 임계값이 적용되며, 결과 표의 '적용 임계' 열에서 확인하실 수 있습니다.")
+            text="권장 설정 적용: 대비 정규화 + Otsu(일괄) + 지형 분할(깊이 0.08). "
+                 "적용 임계는 아래 표시와 결과 표의 '적용 임계' 열에서 확인하십시오.")
 
     # ------------------------------------------------- pixel size per image
     def _default_px(self) -> float:
@@ -935,6 +1126,17 @@ class App:
             return float(self.v["pixel_size_um"].get())
         except ValueError:
             return 0.404
+
+    def _default_depth(self) -> float:
+        try:
+            return float(self.v["terrain_depth"].get())
+        except ValueError:
+            return 0.08
+
+    def _depth_for(self, path) -> float:
+        """This image's terrain depth: its own if set, else the global one."""
+        own = self.depth_info.get(path)
+        return float(own) if own is not None else self._default_depth()
 
     def _px_for(self, path) -> float:
         """The scale to use for one image: its own if known, else the default."""
@@ -950,10 +1152,12 @@ class App:
                 continue
             value, src = self.px_info.get(path, (None, ""))
             name = labels.get(path, os.path.basename(path))
+            own = self.depth_info.get(path)
+            dcol = f"{own:g}" if own is not None else f"({self._default_depth():g})"
             if value:
-                self.flist.item(path, values=(name, f"{value:.4g}", src), tags=())
+                self.flist.item(path, values=(name, f"{value:.4g}", dcol, src), tags=())
             else:
-                self.flist.item(path, values=(name, f"{self._default_px():.4g}",
+                self.flist.item(path, values=(name, f"{self._default_px():.4g}", dcol,
                                               "기본값 사용"), tags=("unknown",))
         self._check_mixed_scales()
 
@@ -970,6 +1174,14 @@ class App:
         if unknown:
             parts.append(f"{len(unknown)}개 이미지는 픽셀 크기를 모릅니다 — "
                          f"기본값 {self._default_px():.4g}를 씁니다.")
+        if self._objectify_key() == "terrain":
+            depths = {round(self._depth_for(q), 6) for q in self.files}
+            if len(depths) > 1:
+                lo, hi = min(depths), max(depths)
+                parts.append(f"지형 깊이 혼재: {lo:g}–{hi:g} ({len(depths)}종). "
+                             f"깊이가 다르면 'Pore 하나'의 정의가 이미지마다 달라지므로 "
+                             f"조건 간 개공율 비교에 그 차이가 섞입니다. 표면이 정말 "
+                             f"다른 경우에만 쓰십시오.")
         self.lbl_mixed.config(text="  ".join(parts))
         return len(scales) > 1
 
@@ -1090,6 +1302,29 @@ class App:
         self._add_files(paths)
 
     # ------------------------------------------------------ clipboard paste
+    # Hardware key codes for V: Windows VK_V, X11, macOS. These do not move
+    # when the keyboard layout or the IME changes, which the keysym does.
+    _V_KEYCODES = (86, 55, 9)
+
+    def _looks_like_paste(self, event) -> bool:
+        keysym = getattr(event, "keysym", "") or ""
+        if keysym in ("", "??"):          # <<Paste>> carries no keysym
+            return True
+        if keysym.lower() == "v":
+            return True
+        return getattr(event, "keycode", None) in self._V_KEYCODES
+
+    def _on_paste_event(self, event=None):
+        """Front door for every paste gesture; collapses the overlapping ones."""
+        if event is not None:
+            if not self._looks_like_paste(event):
+                return None               # some other Control-key combination
+            now = time.monotonic() * 1000.0
+            if now - self._last_paste_ms < 300.0:
+                return "break"            # same keystroke, second binding
+            self._last_paste_ms = now
+        return self._paste_from_clipboard(event)
+
     def _clipboard_dir(self) -> str:
         """A temp folder for pasted bitmaps, removed when the program exits."""
         if self._paste_dir is None:
@@ -1200,7 +1435,7 @@ class App:
         for fp in new:
             self.files.append(fp)
             self.flist.insert("", "end", iid=fp,
-                              values=(os.path.basename(fp), "", ""))
+                              values=(os.path.basename(fp), "", "", ""))
         if new:
             self.status.config(text=f"{len(new)}개 추가 — 총 {len(self.files)}개")
             self._autofill_pixel_size(new)
@@ -1209,6 +1444,7 @@ class App:
         for path in list(self.flist.selection()):
             self.results.pop(path, None)
             self.px_info.pop(path, None)
+            self.depth_info.pop(path, None)
             if path in self.files:
                 self.files.remove(path)
             self.flist.delete(path)
@@ -1219,6 +1455,7 @@ class App:
         self.files.clear()
         self.results.clear()
         self.px_info.clear()
+        self.depth_info.clear()
         self.flist.delete(*self.flist.get_children())
         self._refresh_table()
         self.canvas.delete("all")
@@ -1251,6 +1488,9 @@ class App:
             exclude_border=self.var_border.get(),
             normalize_contrast=self.var_normalize.get(),
             threshold_mode=self._mode_key(),
+            objectify=self._objectify_key(),
+            split_depth_um=f("split_depth_um"),
+            terrain_depth=f("terrain_depth"),
         )
         if p.pixel_size_um <= 0:
             raise ValueError("픽셀 크기는 0보다 커야 합니다.")
@@ -1278,18 +1518,22 @@ class App:
         # thread-safe: touching a Tk variable from the worker deadlocks Tcl.
         autocrop = self.var_autocrop.get()
         px_map = {path: self._px_for(path) for path in self.files}
+        depth_map = {path: self._depth_for(path) for path in self.files}
         labels = unique_labels(self.files)
         threading.Thread(target=self._worker,
-                         args=(list(self.files), p, autocrop, px_map, labels),
+                         args=(list(self.files), p, autocrop, px_map, labels,
+                               depth_map),
                          daemon=True).start()
 
-    def _worker(self, files, p, autocrop, px_map, labels):
+    def _worker(self, files, p, autocrop, px_map, labels, depth_map=None):
         # Pass 1: settle each file's own scale and crop. The batch threshold has
         # to be computed from exactly the pixels that will be analysed, so
         # cropping must be decided before the histogram is pooled.
         plans = []
         for path in files:
-            pp = p.copy_with(pixel_size_um=px_map.get(path, p.pixel_size_um))
+            pp = p.copy_with(pixel_size_um=px_map.get(path, p.pixel_size_um),
+                             terrain_depth=(depth_map or {}).get(path,
+                                                                 p.terrain_depth))
             if autocrop and p.crop_top_px == 0 and p.crop_bottom_px == 0:
                 try:
                     top, bot = detect_bands(load_gray(path))
@@ -1302,7 +1546,7 @@ class App:
         # Pass 2: one threshold from all images, when that mode is selected.
         # A generator keeps only one image in memory at a time.
         forced = None
-        if p.threshold_mode == "otsu_batch":
+        if p.threshold_mode in ("otsu_batch", "otsu3_batch"):
             self._q.put(("status", "모든 이미지의 밝기 분포를 합쳐 공통 임계값 계산 중…"))
 
             def grays():
@@ -1465,6 +1709,107 @@ class App:
                 messagebox.showinfo("저장", f"저장했습니다:\n{fp}")
         ttk.Button(win, text="CSV 저장", command=save).pack(pady=(0, 8))
 
+    # ------------------------------------------------- terrain depth picker
+    def _compare_terrain(self):
+        """
+        Show the selected image segmented at several terrain depths at once.
+
+        The depth is a judgement about what counts as one pore on this surface,
+        and it is made by eye — so the loop of typing a number, re-running and
+        squinting is the actual work. Here the candidates are on screen side by side and a click adopts one.
+        """
+        sel = self._selected_path()
+        if sel is None or sel not in self.results:
+            messagebox.showinfo("선택 필요", "먼저 분석을 실행하고 이미지를 선택하십시오.")
+            return
+        try:
+            p = self._params()
+        except ValueError as e:
+            messagebox.showerror("입력 오류", str(e))
+            return
+        used = getattr(self.results[sel], "used_params", p)
+
+        depths = [0.02, 0.04, 0.08, 0.14, 0.20]
+        cur = self._depth_for(sel)
+        if cur not in depths:
+            depths = sorted(set(depths + [cur]))
+
+        win = tk.Toplevel(self.root)
+        win.title(f"지형 깊이 비교 — {os.path.basename(sel)}")
+        ttk.Label(win, padding=8, justify="left", wraplength=980,
+                  text=("같은 이미지를 지형 깊이만 바꿔 분할한 결과입니다. "
+                        "깊이는 '이만큼은 깊어야 독립된 Pore'라는 기준이라 자동으로 "
+                        "정해지지 않습니다 — 표면을 보고 고르셔야 합니다.\n"
+                        "'전체에 적용'은 모든 이미지의 깊이를 이 값으로 통일하고, "
+                        "'이 이미지만'은 이 파일에만 따로 지정합니다.\n"
+                        "대비 정규화를 켜두셨다면 깊이는 촬영 조건이 아니라 표면의 "
+                        "성질입니다 — 밝기 ±0.10, 대비 0.6~1.4배를 흔들어도 같은 "
+                        "깊이가 같은 분할을 냈습니다. 그러니 표면이 정말 다른 "
+                        "경우가 아니면 '전체에 적용'을 쓰십시오."),
+                  ).pack(fill="x")
+        grid = ttk.Frame(win, padding=6)
+        grid.pack(fill="both", expand=True)
+        self._terrain_thumbs = []
+
+        gray = load_gray(sel, used.crop_bottom_px, used.crop_top_px)
+        for i, depth in enumerate(depths):
+            self.status.config(text=f"지형 깊이 {depth:.2f} 계산 중… "
+                                    f"({i + 1}/{len(depths)})")
+            self.root.update_idletasks()
+            res = analyze_array(gray,
+                                used.copy_with(objectify="terrain",
+                                               terrain_depth=depth),
+                                source=os.path.basename(sel))
+            thumb = _shrink_overlay(res.overlay, 300)
+            img = ImageTk.PhotoImage(Image.fromarray(thumb))
+            self._terrain_thumbs.append(img)          # keep a reference alive
+
+            cell = ttk.Frame(grid, padding=4)
+            cell.grid(row=(i // 3) * 2, column=i % 3, sticky="n")
+            tk.Label(cell, image=img, borderwidth=1, relief="solid").pack()
+            ttk.Label(cell, text=f"지형 깊이 {depth:.2f}",
+                      font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(4, 0))
+            ttk.Label(cell, style="Hint.TLabel", justify="left",
+                      text=(f"유효 {100*res.open_pore_fraction:.1f} %  "
+                            f"무효 {100*res.invalid_pore_fraction:.1f} %\n"
+                            f"Pore {res.n_objects}개  "
+                            f"파랑 {100*res.dropped_border_fraction:.1f} %\n"
+                            f"유효 Pore 원형도 중앙 {res.solidity_median:.3f}")
+                      ).pack(anchor="w")
+
+            # Two buttons, because the depth can legitimately be either. With
+            # 대비 정규화 on it is a property of the surface, not of the capture
+            # — brightness ±0.10 and contrast 0.6-1.4x left the same depth
+            # giving the same segmentation — so one value normally covers a
+            # whole batch. A batch that mixes genuinely different surfaces is
+            # the exception, and then it is per image.
+            row = ttk.Frame(cell)
+            row.pack(anchor="w", pady=(4, 0))
+
+            def adopt_all(d=depth, w=win):
+                self.v["terrain_depth"].set(f"{d:g}")
+                self.var_objectify.set("지형 분할")
+                self.depth_info.clear()
+                self._refresh_all_rows()
+                self.status.config(
+                    text=f"지형 깊이 {d:g}을 전체에 적용 — '분석 실행'을 다시 누르십시오.")
+                w.destroy()
+
+            def adopt_one(d=depth, w=win, path=sel):
+                self.depth_info[path] = float(d)
+                self.var_objectify.set("지형 분할")
+                self._refresh_all_rows()
+                self.status.config(
+                    text=f"{os.path.basename(path)}에만 지형 깊이 {d:g} 적용 — "
+                         f"'분석 실행'을 다시 누르십시오.")
+                w.destroy()
+
+            ttk.Button(row, text="전체에 적용", command=adopt_all).pack(side="left")
+            ttk.Button(row, text="이 이미지만", command=adopt_one).pack(side="left",
+                                                                    padx=(4, 0))
+
+        self.status.config(text="지형 깊이 비교 완료 — 하나를 고르십시오.")
+
     # ------------------------------------------------------------- table
     def _refresh_table(self):
         self.tree.delete(*self.tree.get_children())
@@ -1545,8 +1890,14 @@ class App:
             f"Pore 면적(필터전) {100*res.dark_area_fraction:.1f} % · "
             f"Non-Pore 면적 {100*(1-res.dark_area_fraction):.1f} %\n"
             f"프레임 접촉 제외 {res.n_rejected_border}개 "
-            f"(면적 {100*res.border_area_fraction:.1f} %) — 개공율은 그만큼 과소평가"
-            f"{warn_note}"))
+            f"(면적 {100*res.border_area_fraction:.1f} %) — 개공율은 그만큼 과소평가\n"
+            f"탈락 {100*res.dropped_area_fraction:.1f} % "
+            f"(접촉 {100*res.dropped_border_fraction:.1f} · "
+            f"소형 {100*res.dropped_small_fraction:.1f}) · "
+            f"암부 덩어리 {res.n_blobs_before_split}개"
+            + (f" → 분리 후 {res.n_blobs_after_split}개"
+               if res.n_blobs_after_split != res.n_blobs_before_split else "")
+            + f"{warn_note}"))
 
     # -------------------------------------------------------------- save
     def _save_csv(self):

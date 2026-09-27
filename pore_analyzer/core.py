@@ -21,13 +21,14 @@ from typing import Optional
 
 import numpy as np
 from scipy import ndimage as ndi
-from skimage import measure, morphology, filters
+from skimage import measure, morphology, filters, segmentation
 from PIL import Image
 
 __all__ = ["Params", "Result", "analyze_path", "analyze_array",
            "robustness_sweep", "detect_bands", "load_gray",
            "prepare", "pooled_otsu", "unique_labels",
-           "normalization_window", "contrast_report", "otsu_separability"]
+           "normalization_window", "contrast_report", "otsu_separability",
+           "split_merged", "multiotsu_low", "objectify_mask"]
 
 
 # --------------------------------------------------------------------------
@@ -52,8 +53,12 @@ class Params:
     #   normalize_contrast  rescales each image onto its own intensity span,
     #                       cancelling gain/offset differences between images.
     #   threshold_mode      "fixed"      -> use `threshold` as given
-    #                       "otsu"       -> pick it per image
-    #                       "otsu_batch" -> pick ONE from all images together
+    #                       "otsu"        -> pick it per image
+    #                       "otsu_batch"  -> pick ONE from all images together
+    #                       "otsu3"       -> 3-class Otsu, lower threshold, per
+    #                                        image; for surfaces whose grey
+    #                                        levels form three populations
+    #                       "otsu3_batch" -> the same, one value for the batch
     normalize_contrast: bool = False
     threshold_mode: str = "fixed"
     norm_low_pct: float = 1.0         # percentile mapped to 0 when normalizing
@@ -67,6 +72,35 @@ class Params:
     # the permissive side, since only synthetic evidence stands behind it.
     min_separability: float = 0.70
 
+    # On a rough surface the shadows between asperities form thin dark bridges
+    # that fuse visually separate pores into one blob. Labeling then never
+    # creates the objects the eye sees: on a real pad image a single fused mass
+    # spanning the whole frame held 34 % of all dark area at solidity 0.50, so
+    # every pore inside it was scored as one invalid object. Watershed on the
+    # distance transform cuts those necks.
+    #
+    # Off by default: it changes what counts as one pore, and the absolute
+    # value moves a lot with the depth below (10 % at 2 µm against 19 % at
+    # 0.5 µm on the same image). Turn it on for both conditions or neither.
+    # How dark pixels become objects. This is a separate decision from the
+    # threshold, and treating it as one was the mistake: with plain connected
+    # components an object exists only if the threshold happens to leave a gap
+    # around it, so one over-inclusive threshold turned 30 pores into a single
+    # mass covering 19.7 % of the frame.
+    #
+    #   "cc"        connected components of the binary mask (the original)
+    #   "distance"  watershed on the distance transform — cuts narrow necks,
+    #               but it only sees the mask, so a broad grey join stays joined
+    #   "terrain"   watershed on the GREY IMAGE from its regional minima: each
+    #               basin is one pore, found by depth rather than by whether the
+    #               threshold separated it. Measured on the real image with the
+    #               bad 2-class threshold left in place: largest object
+    #               19.7 % -> 0.53 % of the field, frame-swallowed area
+    #               40.7 % -> 5.1 %.
+    objectify: str = "cc"
+    split_depth_um: float = 1.0       # "distance": necks shallower than this
+    terrain_depth: float = 0.08       # "terrain": basin depth, brightness units
+
     # Smoothing and opening are pixel operations, so at two magnifications the
     # same pixel count is a different physical size. Setting these in µm keeps
     # the physical scale identical across images taken at different mags, which
@@ -78,6 +112,11 @@ class Params:
         if self.sigma_um is None:
             return self.sigma_px
         return self.sigma_um / self.pixel_size_um if self.pixel_size_um > 0 else 0.0
+
+    def resolved_split_depth_px(self) -> float:
+        if self.pixel_size_um <= 0:
+            return 0.0
+        return max(0.0, self.split_depth_um / self.pixel_size_um)
 
     def resolved_opening_px(self) -> int:
         if self.opening_radius_um is None:
@@ -107,6 +146,8 @@ class Result:
     n_objects: int = 0                # objects surviving all filters
     n_rejected_small: int = 0
     n_rejected_border: int = 0
+    n_blobs_before_split: int = 0     # connected dark blobs, before watershed
+    n_blobs_after_split: int = 0      # after it (equal when splitting is off)
 
     dark_area_fraction: float = 0.0   # raw dark pixel fraction (diagnostic only)
     open_pore_fraction: float = 0.0   # PRIMARY metric: solidity>=cut area / field area
@@ -114,6 +155,9 @@ class Result:
     total_pore_fraction: float = 0.0    # every kept object's area / field area
     valid_count_ratio: float = float("nan")   # 1 - concave_ratio, by count
     border_area_fraction: float = 0.0 # area lost to frame-touching objects
+    dropped_area_fraction: float = 0.0    # detected then filtered out, total
+    dropped_border_fraction: float = 0.0  # of that, dropped at the frame (blue)
+    dropped_small_fraction: float = 0.0   # of that, under min diameter (purple)
 
     circularity_median: float = float("nan")
     circularity_q1: float = float("nan")
@@ -127,6 +171,7 @@ class Result:
     mean_convex_deficiency: float = float("nan")
 
     otsu_threshold: float = float("nan")    # this image's own Otsu value
+    otsu3_threshold: float = float("nan")   # lower of its 3-class thresholds
     effective_threshold: float = float("nan")  # what was actually applied
     threshold_source: str = ""              # 고정 / Otsu(이미지별) / Otsu(일괄)
     separability: float = float("nan")      # Otsu eta on the prepared image
@@ -172,10 +217,16 @@ class Result:
             "mean_convex_deficiency_pct": _r(100 * self.mean_convex_deficiency, 1),
             "n_rejected_small": self.n_rejected_small,
             "n_rejected_border": self.n_rejected_border,
+            "n_blobs_before_split": self.n_blobs_before_split,
+            "split_gain": self.n_blobs_after_split - self.n_blobs_before_split,
             "border_area_fraction_pct": round(100 * self.border_area_fraction, 2),
+            "dropped_area_pct": round(100 * self.dropped_area_fraction, 2),
+            "dropped_border_pct": round(100 * self.dropped_border_fraction, 2),
+            "dropped_small_pct": round(100 * self.dropped_small_fraction, 2),
             "effective_threshold": _r(self.effective_threshold, 4),
             "threshold_source": self.threshold_source,
             "otsu_threshold_ref": _r(self.otsu_threshold, 3),
+            "otsu3_threshold_ref": _r(self.otsu3_threshold, 3),
             "separability": _r(self.separability, 3),
             "dynamic_range": _r(self.dynamic_range, 3),
             "gray_levels": self.gray_levels,
@@ -230,44 +281,60 @@ def _scan_band(gray: np.ndarray, from_bottom: bool) -> int:
     (std < 0.01) AND close to pure black or pure white, and the whole run must
     be at least 1.5 % of the image height while staying under one third of it.
     """
+    best = 0
+    # A resized or screen-captured frame often carries one or two blended rows
+    # right at the edge — a grey seam that is neither flat nor extreme. The scan
+    # used to stop dead on it and miss the whole bar behind it: on a real 329-row
+    # image a single 0.17-grey bottom row hid a 23-row SEM data bar, which then
+    # sat in the denominator and pulled the open-pore fraction down ~7 %. So
+    # allow a short lead-in, and count those rows as part of the band.
+    for skip in (0, 1, 2, 3):
+        n = _scan_band_from(gray, from_bottom, skip)
+        if n:
+            best = max(best, n + skip)
+    return best
+
+
+def _scan_band_from(gray: np.ndarray, from_bottom: bool, skip: int) -> int:
     h = gray.shape[0]
     row_std = gray.std(axis=1)
     row_mean = gray.mean(axis=1)
-    limit = h // 3
+    limit = h // 3 - skip
+    if limit <= 0:
+        return 0
 
-    # index of the k-th row inward from the chosen edge
+    # index of the k-th row inward from the chosen edge, past the lead-in
     def idx(k):
-        return h - 1 - k if from_bottom else k
+        j = k + skip
+        return h - 1 - j if from_bottom else j
 
     body = row_mean[h // 4: 3 * h // 4]
     body_mean = float(np.median(body)) if body.size else float(np.median(row_mean))
 
+    # A band row is judged by its MEDIAN, not by flatness or by counting
+    # extreme pixels. A data bar carrying white text is not flat, and once the
+    # capture has been downscaled its anti-aliased glyph edges leave a third of
+    # the row in mid-grey, so an extreme-pixel count drops under any usable
+    # cut-off — that is how a 23-row bar went undetected. The median ignores the
+    # text entirely: a black bar reads ~0.0 and an image row ~0.5, whatever is
+    # printed on it. The body-contrast test at the end still guards against
+    # eating a genuinely dark image, whose body median is equally low.
+    med = np.median(gray, axis=1)
+
+    def is_band(i, dark):
+        return med[i] < 0.10 if dark else med[i] > 0.90
+
+    first = idx(0)
+    if med[first] >= 0.10 and med[first] <= 0.90:
+        return 0
+    dark_band = med[first] < 0.10
+
     n = 0
-    while n < limit:
-        i = idx(n)
-        flat = row_std[i] < 0.01
-        extreme = (row_mean[i] < 0.12) or (row_mean[i] > 0.88)
-        if flat and extreme:
-            n += 1
-        else:
-            break
+    while n < limit and is_band(idx(n), dark_band):
+        n += 1
 
     if n < max(6, int(h * 0.015)):
         return 0
-
-    band_rows = [idx(k) for k in range(n)]
-    dark_band = float(np.mean(row_mean[band_rows])) < 0.5
-
-    # Extend inward through annotation rows inside the same band: a row of
-    # white text on a black bar is not flat, but almost every pixel in it is
-    # still at one extreme of the range.
-    while n < limit:
-        row = gray[idx(n)]
-        frac = float(np.mean(row < 0.12) if dark_band else np.mean(row > 0.88))
-        if frac >= 0.75:
-            n += 1
-        else:
-            break
 
     band_rows = [idx(k) for k in range(n)]
     if abs(float(np.mean(row_mean[band_rows])) - body_mean) < 0.15:
@@ -441,6 +508,65 @@ def _otsu_from_hist(counts: np.ndarray, centers: np.ndarray) -> float:
     return float(centers[int(np.argmax(var))])
 
 
+MULTI_NBINS = 1024          # pair search is O(nbins^2), so a coarser grid
+
+
+def _multiotsu_from_hist(counts: np.ndarray, centers: np.ndarray) -> tuple:
+    """
+    Otsu's method extended to three classes: the pair of thresholds maximizing
+    the between-class variance, found by an exhaustive vectorized search.
+
+    Why three. A worn pad surface holds three brightness populations, not two:
+    the deep pores, the mid-grey shadow of the roughened ligaments, and the
+    bright matrix. Two-class Otsu has to draw ONE line through that and puts it
+    between mid-grey and bright, so the shadow joins the pores — on a real
+    image it called 49 % of the field dark and fused it into a mass covering
+    19.7 % of the frame. The lower of the three-class thresholds lands between
+    pore and shadow instead: 0.357 against the 0.34 that matched the eye, and
+    the largest blob fell to 2.6 %.
+
+    Agreement with skimage.filters.threshold_multiotsu was within 0.001 on the
+    same histogram; implemented here so a frozen build cannot drift with the
+    scikit-image version.
+    """
+    counts = np.asarray(counts, dtype=np.float64)
+    total = counts.sum()
+    if total <= 0 or counts.size < 3:
+        return (float("nan"), float("nan"))
+    pr = counts / total
+    w = np.cumsum(pr)
+    m = np.cumsum(pr * centers)
+    w0 = w[:, None]
+    w1 = w[None, :] - w[:, None]
+    w2 = 1.0 - w[None, :]
+    m0 = m[:, None]
+    m1 = m[None, :] - m[:, None]
+    m2 = m[-1] - m[None, :]
+    n = pr.size
+    ok = (np.arange(n)[None, :] > np.arange(n)[:, None])
+    ok &= (w0 > 1e-12) & (w1 > 1e-12) & (w2 > 1e-12)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        score = (m0 ** 2 / np.maximum(w0, 1e-300)
+                 + m1 ** 2 / np.maximum(w1, 1e-300)
+                 + m2 ** 2 / np.maximum(w2, 1e-300))
+    score = np.where(ok, score, -1.0)
+    score = np.nan_to_num(score, nan=-1.0, posinf=-1.0, neginf=-1.0)
+    if not np.any(score > 0):
+        return (float("nan"), float("nan"))
+    a, b = np.unravel_index(int(np.argmax(score)), score.shape)
+    return float(centers[a]), float(centers[b])
+
+
+def multiotsu_low(sm: np.ndarray, nbins: int = MULTI_NBINS) -> float:
+    """The lower of the two three-class thresholds, for one prepared image."""
+    sm = np.asarray(sm).ravel()
+    if sm.size == 0:
+        return float("nan")
+    edges = np.linspace(0.0, 1.0, int(nbins) + 1)
+    counts, _ = np.histogram(sm, bins=edges)
+    return _multiotsu_from_hist(counts, 0.5 * (edges[:-1] + edges[1:]))[0]
+
+
 def pooled_otsu(grays, p: Params, nbins: int = POOLED_NBINS) -> float:
     """
     One Otsu threshold computed from several images at once.
@@ -466,7 +592,8 @@ def pooled_otsu(grays, p: Params, nbins: int = POOLED_NBINS) -> float:
         2048x1536 field would outvote a 1024x768 one four to one in setting a
         threshold that is then applied to both.
     """
-    nbins = max(2, int(nbins))
+    three = str(p.threshold_mode).startswith("otsu3")
+    nbins = MULTI_NBINS if three else max(2, int(nbins))
     edges = np.linspace(0.0, 1.0, nbins + 1)
     centers = 0.5 * (edges[:-1] + edges[1:])
     hist = np.zeros(nbins, dtype=np.float64)
@@ -480,6 +607,8 @@ def pooled_otsu(grays, p: Params, nbins: int = POOLED_NBINS) -> float:
         n_img += 1
     if n_img == 0:
         return float("nan")
+    if three:
+        return _multiotsu_from_hist(hist, centers)[0]
     return _otsu_from_hist(hist, centers)
 
 
@@ -516,15 +645,23 @@ def analyze_array(gray: np.ndarray, p: Params, source: str = "",
         res.otsu_threshold = float(filters.threshold_otsu(sm))
     except Exception:
         res.otsu_threshold = float("nan")
+    try:
+        res.otsu3_threshold = multiotsu_low(sm)
+    except Exception:
+        res.otsu3_threshold = float("nan")
 
     if forced_threshold is not None:
         thr = float(forced_threshold)
-        res.threshold_source = "Otsu(일괄)"
+        res.threshold_source = ("Otsu3(일괄)" if str(p.threshold_mode).startswith("otsu3")
+                                else "Otsu(일괄)")
     elif p.threshold_mode == "otsu":
         thr = res.otsu_threshold
         res.threshold_source = "Otsu(이미지별)"
-    else:                                  # "fixed", and "otsu_batch" without
-        thr = p.threshold                  # a pooled value supplied
+    elif p.threshold_mode == "otsu3":
+        thr = res.otsu3_threshold
+        res.threshold_source = "Otsu3(이미지별)"
+    else:                                  # "fixed", and the batch modes
+        thr = p.threshold                  # without a pooled value supplied
         res.threshold_source = "고정"
     if not np.isfinite(thr):
         thr = p.threshold
@@ -535,8 +672,9 @@ def analyze_array(gray: np.ndarray, p: Params, source: str = "",
     if np.isfinite(res.separability) and res.separability < p.min_separability:
         res.warnings.append(
             f"밝기 분리도 {res.separability:.2f} (<{p.min_separability:.2f}) — "
-            "두 계급으로 갈라지지 않는 이미지입니다. 임계값이 사실상 임의로 "
-            "정해지므로 이 행의 개공율은 신뢰하지 마십시오.")
+            "두 계급으로 갈라지지 않는 이미지입니다. 밝기 무리가 셋이라 "
+            "그럴 수 있으니 임계 모드를 'Otsu(3계급)'으로 두고 비교해 "
+            "보십시오. 그래도 낮으면 이 행의 개공율은 신뢰하지 마십시오.")
     if res.gray_levels and res.gray_levels < 12:
         res.warnings.append(
             f"정규화 구간의 계조가 {res.gray_levels}단계뿐입니다 — "
@@ -555,17 +693,30 @@ def analyze_array(gray: np.ndarray, p: Params, source: str = "",
     if open_px > 0:
         binary = morphology.opening(binary, morphology.disk(open_px))
 
-    # ---- labeling & metrics -------------------------------------------
+    # ---- turn dark pixels into objects ---------------------------------
     lbl = measure.label(binary, connectivity=2)
+    res.n_blobs_before_split = int(lbl.max())
+    if p.objectify != "cc":
+        lbl = objectify_mask(sm, binary, p)
+    res.n_blobs_after_split = int(lbl.max())
     props = measure.regionprops(lbl)
 
     px_area = p.pixel_size_um ** 2
     min_area_px = math.pi * (p.min_diam_um / p.pixel_size_um / 2.0) ** 2
 
     kept, border_area_px = [], 0.0
+    # Detected, then filtered out. Kept apart by reason: the two are drawn in
+    # different colours so the reason is checkable on screen instead of taken
+    # on trust. A single frame-touching blob can snake from an edge into the
+    # middle of the field, which looks nothing like "touching the frame" until
+    # you can see that it is one object.
+    drop_small, drop_border = [], []
+    small_area_px = 0.0
     for pr in props:
         if pr.area < min_area_px:
             res.n_rejected_small += 1
+            small_area_px += pr.area
+            drop_small.append(int(pr.label))
             continue
         r0, c0, r1, c1 = pr.bbox
         touches = (r0 == 0) or (c0 == 0) or (r1 == h) or (c1 == w)
@@ -573,6 +724,7 @@ def analyze_array(gray: np.ndarray, p: Params, source: str = "",
             res.n_rejected_border += 1
             border_area_px += pr.area
             if p.exclude_border:
+                drop_border.append(int(pr.label))
                 continue
         try:
             eqd_px = pr.equivalent_diameter_area   # scikit-image >= 0.24
@@ -623,42 +775,151 @@ def analyze_array(gray: np.ndarray, p: Params, source: str = "",
         res.concave_ratio = float((~convex_mask).sum() / len(kept))
         res.valid_count_ratio = 1.0 - res.concave_ratio
         res.mean_convex_deficiency = float(np.nanmean(1.0 - sol))
+
+    # A solidity cut sitting on top of the distribution's median makes the
+    # valid/invalid split a coin flip: on the real image under terrain
+    # objectification the median was 0.899 against a cut of 0.90, and the
+    # reported figure swung from 3.1 % to 36.9 % as the cut moved 0.95 -> 0.80.
+    # Watershed cells carry straight cut edges where they meet a neighbour,
+    # which lowers solidity systematically — the 0.90 default was calibrated on
+    # free-standing connected components (median there: 0.943).
+    if kept and np.isfinite(res.solidity_median):
+        gap = abs(res.solidity_median - p.solidity_cut)
+        if gap < 0.03:
+            near = int(((sol > p.solidity_cut - 0.02)
+                        & (sol < p.solidity_cut + 0.02)).sum())
+            res.warnings.append(
+                f"유효 Pore 원형도 중앙값 {res.solidity_median:.3f}이 기준 "
+                f"{p.solidity_cut:.2f}에 거의 겹칩니다({near}/{len(kept)}개가 기준 "
+                f"±0.02 안). 기준을 조금만 움직여도 유효/무효가 크게 뒤집히니 "
+                f"'강건성 스윕'으로 확인하고, 절대값보다 조건 간 대소 관계를 "
+                f"쓰십시오.")
     else:
         res.open_pore_fraction = 0.0
 
+    dropped_border_px = sum(int(pr.area) for pr in props
+                            if int(pr.label) in set(drop_border))
+    res.dropped_small_fraction = small_area_px / float(h * w)
+    res.dropped_border_fraction = dropped_border_px / float(h * w)
+    res.dropped_area_fraction = (res.dropped_small_fraction
+                                 + res.dropped_border_fraction)
+
     res.binary = binary
-    res.overlay = _make_overlay(gray, lbl, kept, p)
+    res.overlay = _make_overlay(gray, lbl, kept, p, drop_small, drop_border)
     return res
 
 
-def _make_overlay(gray: np.ndarray, lbl: np.ndarray, kept: list, p: Params) -> np.ndarray:
-    """RGB uint8 overlay: convex openings green, rejected/concave red."""
+def objectify_mask(sm: np.ndarray, binary: np.ndarray, p: Params) -> np.ndarray:
+    """
+    Label the mask into objects by whichever rule `p.objectify` names.
+
+    "terrain" is the one that does not depend on the threshold having left a
+    gap between two pores. Each pore is a basin in the grey image; the regional
+    minima deeper than `terrain_depth` are its markers, and flooding the grey
+    image from them puts a boundary on the ridge between neighbouring basins —
+    the ligament — whether or not that ridge rose above the threshold. The
+    threshold is then only deciding how far down the slope a pore extends, not
+    whether it exists at all.
+
+    `terrain_depth` is in brightness units on the prepared image, because that
+    is what it measures: how much a dip must deepen before it counts as its own
+    pore rather than texture inside one. Not a length, so no µm.
+    """
+    mode = str(p.objectify or "cc")
+    if mode == "distance":
+        return split_merged(binary, p)
+    if mode != "terrain":
+        return measure.label(binary, connectivity=2)
+    if not binary.any():
+        return measure.label(binary, connectivity=2)
+    depth = max(1e-6, float(p.terrain_depth))
+    markers = measure.label(morphology.h_minima(sm, depth) & binary, connectivity=2)
+    if markers.max() == 0:                 # nothing deep enough: fall back
+        return measure.label(binary, connectivity=2)
+    return segmentation.watershed(sm, markers, mask=binary)
+
+
+def split_merged(binary: np.ndarray, p: Params) -> np.ndarray:
+    """
+    Cut the thin necks that fuse separate pores into one blob.
+
+    The distance transform peaks at the centre of each lobe and dips at the
+    neck between two of them, so a watershed flooded from those peaks puts the
+    boundary exactly at the neck. h-maxima sets which peaks count: maxima
+    shallower than `h` are absorbed into their neighbour, so `h` is literally
+    "how much deeper than its neck a lobe must be to count as its own pore",
+    measured in the same units as the inscribed radius. Expressed in µm so it
+    means the same thing at any magnification.
+
+    Returns a label image; falls back to plain labeling if no marker survives.
+    """
+    h = p.resolved_split_depth_px()
+    if h <= 0 or not binary.any():
+        return measure.label(binary, connectivity=2)
+    dist = ndi.distance_transform_edt(binary)
+    markers = measure.label(morphology.h_maxima(dist, h), connectivity=2)
+    if markers.max() == 0:
+        return measure.label(binary, connectivity=2)
+    return segmentation.watershed(-dist, markers, mask=binary)
+
+
+def _make_overlay(gray: np.ndarray, lbl: np.ndarray, kept: list, p: Params,
+                  drop_small: list = None, drop_border: list = None) -> np.ndarray:
+    """
+    RGB uint8 overlay, one colour per outcome:
+
+        green   valid pore, counted in the open-pore fraction
+        red     invalid (solidity below the cut) — counted in the total only
+        blue    dropped because the object touches the frame
+        purple  dropped because it is under the minimum equivalent diameter
+
+    None of this is decoration. Filtered objects used to be left unpainted,
+    which made "the program never found this pore" and "it found it and threw
+    it away" identical on screen; on a real pad image 40.7 % of the field was
+    discarded and invisible. Splitting the two discard reasons by colour is the
+    next step: a single frame-touching blob measured 19.7 % of the field and
+    reached from the left edge to the centre, so "touching the frame" is not
+    something the user can confirm by looking at where the colour sits — only
+    by seeing that the whole mass is one colour and runs to an edge.
+    """
     base = (np.clip(gray, 0, 1) * 255).astype(np.uint8)
     rgb = np.dstack([base, base, base]).astype(np.float64)
 
-    keep_labels = {o["label"]: o["solidity"] for o in kept}
-    if not keep_labels:
+    top = int(lbl.max())
+    if top <= 0:
         return rgb.astype(np.uint8)
 
-    lut_convex = np.zeros(lbl.max() + 1, dtype=bool)
-    lut_concave = np.zeros(lbl.max() + 1, dtype=bool)
-    for lab, sol in keep_labels.items():
-        if np.isfinite(sol) and sol >= p.solidity_cut:
-            lut_convex[lab] = True
-        else:
-            lut_concave[lab] = True
+    lut_convex = np.zeros(top + 1, dtype=bool)
+    lut_concave = np.zeros(top + 1, dtype=bool)
+    lut_border = np.zeros(top + 1, dtype=bool)
+    lut_small = np.zeros(top + 1, dtype=bool)
+    for o in kept:
+        lab, sol = o["label"], o["solidity"]
+        if 0 <= lab <= top:
+            if np.isfinite(sol) and sol >= p.solidity_cut:
+                lut_convex[lab] = True
+            else:
+                lut_concave[lab] = True
+    for lab in (drop_border or ()):
+        if 0 <= lab <= top:
+            lut_border[lab] = True
+    for lab in (drop_small or ()):
+        if 0 <= lab <= top:
+            lut_small[lab] = True
 
-    mconv = lut_convex[lbl]
-    mconc = lut_concave[lbl]
+    m_bord, m_small = lut_border[lbl], lut_small[lbl]
+    mconv, mconc = lut_convex[lbl], lut_concave[lbl]
 
     # fill, then draw boundaries brighter
+    rgb[m_bord] = 0.62 * rgb[m_bord] + 0.38 * np.array([52, 152, 219])
+    rgb[m_small] = 0.62 * rgb[m_small] + 0.38 * np.array([155, 89, 182])
     rgb[mconv] = 0.55 * rgb[mconv] + 0.45 * np.array([46, 204, 113])
     rgb[mconc] = 0.55 * rgb[mconc] + 0.45 * np.array([231, 76, 60])
 
-    edge_c = mconv ^ ndi.binary_erosion(mconv)
-    edge_x = mconc ^ ndi.binary_erosion(mconc)
-    rgb[edge_c] = np.array([26, 188, 156])
-    rgb[edge_x] = np.array([192, 57, 43])
+    for mask, colour in ((m_bord, (41, 128, 185)), (m_small, (125, 60, 152)),
+                         (mconv, (26, 188, 156)), (mconc, (192, 57, 43))):
+        if mask.any():
+            rgb[mask ^ ndi.binary_erosion(mask)] = np.array(colour)
 
     return np.clip(rgb, 0, 255).astype(np.uint8)
 

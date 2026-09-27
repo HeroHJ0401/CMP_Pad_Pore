@@ -213,6 +213,169 @@ def main():
                    abs(r_real.norm_low_pct_used - 1.0) < 1e-9
                    and not any("하위 기준" in w for w in r_real.warnings)))
 
+    # ---- three brightness populations need three classes ----------------
+    # A worn surface holds deep pores, mid-grey shadow and bright matrix. Two-
+    # class Otsu must draw one line through that and puts it between shadow and
+    # matrix, so the shadow is scored as pore and fuses everything it touches.
+    # Here the truth is known: pores at 0.20, shadow at 0.45, matrix at 0.80.
+    rng3 = np.random.default_rng(17)
+    three = np.full((300, 400), 0.80)
+    three[:, :160] = 0.45                                 # the mid-grey band
+    yy3, xx3 = np.ogrid[:300, :400]
+    for cy, cx in ((70, 70), (150, 90), (220, 60), (90, 300), (200, 330)):
+        three[((yy3 - cy) ** 2 + (xx3 - cx) ** 2) <= 30 ** 2] = 0.20
+    three = np.clip(three + rng3.normal(0, 0.02, three.shape), 0, 1)
+    p2 = Params(pixel_size_um=0.5, min_diam_um=1.0, threshold_mode="otsu")
+    r2c = analyze_array(three, p2)
+    r3c = analyze_array(three, p2.copy_with(threshold_mode="otsu3"))
+    checks.append(("2-class Otsu lands between shadow and matrix",
+                   0.45 < r2c.effective_threshold < 0.80))
+    checks.append(("3-class Otsu lands between pore and shadow",
+                   0.20 < r3c.effective_threshold < 0.45))
+    checks.append(("so 2-class calls far more of the field dark",
+                   r2c.dark_area_fraction > 2 * r3c.dark_area_fraction))
+    checks.append(("the threshold's origin is reported",
+                   r2c.threshold_source == "Otsu(이미지별)"
+                   and r3c.threshold_source == "Otsu3(이미지별)"))
+    checks.append(("both reference thresholds are always available",
+                   np.isfinite(r2c.otsu_threshold) and np.isfinite(r2c.otsu3_threshold)
+                   and r2c.otsu3_threshold < r2c.otsu_threshold))
+    # the batch form has to keep the order-independence the 2-class one has
+    imgs3 = [three, np.clip(three * 0.85 + 0.05, 0, 1),
+             np.clip(three * 1.1 - 0.04, 0, 1)]
+    pb3 = Params(normalize_contrast=True, threshold_mode="otsu3_batch")
+    seen3 = {round(pooled_otsu((imgs3[i] for i in order), pb3), 12)
+             for order in itertools.permutations(range(3))}
+    checks.append(("3-class batch Otsu is identical for every file order",
+                   len(seen3) == 1))
+    checks.append(("3-class batch agrees with the single-image value on one image",
+                   abs(pooled_otsu([three], Params(threshold_mode="otsu3_batch"))
+                       - analyze_array(three, p2.copy_with(threshold_mode="otsu3")
+                                       ).effective_threshold) < 0.01))
+
+    # ---- fused pores must be separable, and only when asked -------------
+    # Thin dark bridges between asperities fuse visually separate pores into one
+    # blob. The fused blob is deeply concave, so it scores invalid, and if it
+    # reaches the frame it is dropped whole — which looks exactly like "the
+    # program never found these pores". A dumbbell is the minimal case.
+    H2, W2 = 200, 320
+    yy2, xx2 = np.ogrid[:H2, :W2]
+    dumbbell = np.ones((H2, W2))
+    for cx in (110, 210):
+        dumbbell[((yy2 - 100) ** 2 + (xx2 - cx) ** 2) <= 38 ** 2] = 0.0
+    dumbbell[96:105, 110:210] = 0.0                      # the neck
+    ps = Params(pixel_size_um=0.5, sigma_px=0.0, opening_radius_px=0,
+                threshold=0.5, min_diam_um=1.0, solidity_cut=0.90)
+    r_join = analyze_array(dumbbell, ps)
+    r_cut = analyze_array(dumbbell, ps.copy_with(objectify="distance",
+                                                 split_depth_um=5.0))
+    checks.append(("fused pores are one blob until splitting is asked for",
+                   r_join.n_blobs_before_split == 1
+                   and r_join.n_blobs_after_split == 1
+                   and r_join.n_objects == 1))
+    checks.append(("splitting turns the dumbbell into two pores",
+                   r_cut.n_blobs_after_split == 2 and r_cut.n_objects == 2))
+    checks.append(("the fused blob was invalid, the split ones are valid",
+                   r_join.open_pore_fraction < r_cut.open_pore_fraction))
+    checks.append(("splitting does not invent or lose dark area",
+                   abs(r_join.dark_area_fraction - r_cut.dark_area_fraction) < 1e-12))
+    # the depth is in µm, so it has to mean the same thing at any magnification
+    coarse = analyze_array(dumbbell, ps.copy_with(objectify="distance",
+                                                  split_depth_um=5.0,
+                                                  pixel_size_um=1.0))
+    checks.append(("split depth in µm behaves the same at another scale",
+                   coarse.n_blobs_after_split == r_cut.n_blobs_after_split))
+
+    # ---- objectification must not depend on the threshold being right ---
+    # The point of "terrain": two pores separated by a ligament that the
+    # threshold failed to keep above the cut. Connected components see one
+    # object; flooding the grey image from its two basins sees two, because the
+    # ridge between them is still a ridge whether or not it rose above the
+    # threshold. Built so the ridge (0.44) sits BELOW a deliberately bad
+    # threshold (0.55) — the case that broke the real image.
+    H4, W4 = 220, 340
+    yy4, xx4 = np.ogrid[:H4, :W4]
+    bowls = np.full((H4, W4), 0.90)
+    for cx in (120, 200):
+        d4 = np.sqrt((yy4 - 110) ** 2 + (xx4 - cx) ** 2)
+        bowls = np.minimum(bowls, 0.15 + 0.75 * np.clip(d4 / 60.0, 0, 1))
+    # floors at 0.15, the saddle between them at 0.65, and a threshold of 0.72
+    # deliberately set above the saddle so the mask fuses the two.
+    pb_bad = Params(pixel_size_um=0.5, sigma_px=0.0, opening_radius_px=0,
+                    threshold_mode="fixed", threshold=0.72, min_diam_um=1.0,
+                    solidity_cut=0.0)
+    r_cc = analyze_array(bowls, pb_bad)
+    r_terr = analyze_array(bowls, pb_bad.copy_with(objectify="terrain",
+                                                   terrain_depth=0.04))
+    checks.append(("connected components fuse the two bowls",
+                   r_cc.n_blobs_before_split == 1 and r_cc.n_objects == 1))
+    checks.append(("terrain splits them despite the bad threshold",
+                   r_terr.n_objects == 2))
+    checks.append(("terrain does not change which pixels are dark",
+                   abs(r_cc.dark_area_fraction - r_terr.dark_area_fraction) < 1e-12))
+    checks.append(("terrain keeps the same total pore area",
+                   abs(r_cc.total_pore_fraction - r_terr.total_pore_fraction) < 0.01))
+    # a depth deeper than the basins themselves must fall back, not blow up
+    r_deep = analyze_array(bowls, pb_bad.copy_with(objectify="terrain",
+                                                   terrain_depth=5.0))
+    checks.append(("an impossible terrain depth falls back to one object",
+                   r_deep.n_objects == 1))
+
+    # A solidity cut sitting on the median makes valid/invalid a coin flip.
+    # Watershed cells carry straight cut edges, which lowers solidity
+    # systematically, so this has to be flagged rather than reported straight.
+    knife = analyze_array(gray, Params(threshold_mode="otsu", normalize_contrast=True,
+                                       solidity_cut=0.0))
+    on_cut = analyze_array(gray, Params(threshold_mode="otsu", normalize_contrast=True,
+                                        solidity_cut=float(knife.solidity_median)))
+    off_cut = analyze_array(gray, Params(threshold_mode="otsu", normalize_contrast=True,
+                                         solidity_cut=float(knife.solidity_median) - 0.2))
+    checks.append(("a solidity cut on the median is flagged",
+                   any("거의 겹칩니다" in w for w in on_cut.warnings)))
+    checks.append(("a cut well clear of the median is not flagged",
+                   not any("거의 겹칩니다" in w for w in off_cut.warnings)))
+
+    # ---- what was thrown away has to be visible, not silently absent ----
+    edge = np.ones((160, 160))
+    edge[0:40, 0:40] = 0.0                                # touches the frame
+    edge[90:120, 90:120] = 0.0                            # does not
+    pe = Params(pixel_size_um=0.5, sigma_px=0.0, opening_radius_px=0,
+                threshold=0.5, min_diam_um=1.0)
+    edge[140:144, 140:144] = 0.0                          # under the min diameter
+    r_edge = analyze_array(edge, pe.copy_with(min_diam_um=2.5))
+    checks.append(("frame-touching objects are reported as dropped area",
+                   r_edge.dropped_border_fraction > 0.0))
+    checks.append(("small objects are reported separately",
+                   r_edge.dropped_small_fraction > 0.0))
+    checks.append(("the two reasons add up to the total",
+                   abs(r_edge.dropped_area_fraction
+                       - (r_edge.dropped_border_fraction
+                          + r_edge.dropped_small_fraction)) < 1e-12))
+    # each reason must carry its OWN colour, or the user cannot check which
+    # rule fired — a frame-touching blob can reach the middle of the field and
+    # look nothing like "at the frame".
+    ov = r_edge.overlay
+    checks.append(("dropped area is drawn, not left blank",
+                   ov is not None and bool((ov[5, 5] != ov[80, 5]).any())))
+    checks.append(("the two drop reasons are drawn in different colours",
+                   bool((ov[5, 5] != ov[141, 141]).any())))
+    checks.append(("frame-touching is blue and small is not",
+                   int(ov[5, 5][2]) > int(ov[5, 5][0])
+                   and int(ov[141, 141][0]) > int(ov[5, 5][0])))
+    r_keep = analyze_array(edge, pe.copy_with(exclude_border=False))
+    checks.append(("nothing is dropped at the frame when nothing is excluded",
+                   r_keep.dropped_border_fraction == 0.0))
+
+    # ---- an SEM data bar carrying text must still be found --------------
+    # The bar is not flat — it has white text on it — and a downscaled capture
+    # blurs the glyph edges, which defeated both the flatness test and an
+    # extreme-pixel count. A grey seam row at the very edge hid it completely.
+    barred = np.vstack([gray, np.zeros((26, gray.shape[1]))])
+    barred[-20:-14, 20:120] = 1.0                        # white text on the bar
+    barred[-1, :] = 0.17                                 # blended edge row
+    checks.append(("a data bar with text and a blended edge row is detected",
+                   abs(detect_bands(barred)[1] - 26) <= 2))
+
     row = res.summary_row()
     checks.append(("CSV carries all three area fractions",
                    abs(row["valid_pore_fraction_pct"] + row["invalid_pore_fraction_pct"]

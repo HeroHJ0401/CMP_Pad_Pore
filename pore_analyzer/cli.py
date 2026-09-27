@@ -30,9 +30,18 @@ def build_parser():
     ap.add_argument("--crop-top", type=int, default=0, help="상단 크롭 px (기본 0, 0이면 자동 감지)")
     ap.add_argument("--no-autocrop", action="store_true", help="위·아래 단색 띠 자동 크롭 비활성화")
     ap.add_argument("--keep-border", action="store_true", help="프레임 접촉 객체를 제외하지 않음")
-    ap.add_argument("--mode", choices=["fixed", "otsu", "otsu-batch"], default="fixed",
+    ap.add_argument("--mode",
+                    choices=["fixed", "otsu", "otsu-batch", "otsu3", "otsu3-batch"],
+                    default="fixed",
                     help="임계 결정 방식 (기본 fixed). otsu-batch는 모든 이미지의 "
                          "밝기 분포를 합쳐 공통 임계값 하나를 적용")
+    ap.add_argument("--objectify", choices=["cc", "distance", "terrain"], default="cc",
+                    help="어두운 픽셀을 객체로 묶는 방식. cc=연결 성분(기본), "
+                         "distance=거리 분할, terrain=회색조 지형 분할(임계값에 덜 종속)")
+    ap.add_argument("--split-depth", type=float, default=1.0,
+                    help="거리 분할의 깊이 µm (기본 1.0)")
+    ap.add_argument("--terrain-depth", type=float, default=0.08,
+                    help="지형 분할의 분지 깊이, 밝기 0~1 (기본 0.08)")
     ap.add_argument("--normalize", action="store_true",
                     help="이미지마다 대비를 정규화한 뒤 임계 적용 (밝기 차이 상쇄)")
     ap.add_argument("--auto-pixel-size", action="store_true",
@@ -79,6 +88,9 @@ def main(argv=None):
         crop_top_px=args.crop_top,
         exclude_border=not args.keep_border,
         normalize_contrast=args.normalize,
+        objectify=args.objectify,
+        split_depth_um=args.split_depth,
+        terrain_depth=args.terrain_depth,
         threshold_mode=args.mode.replace("-", "_"),
         sigma_um=args.sigma_um,
         opening_radius_um=args.opening_um,
@@ -116,7 +128,7 @@ def main(argv=None):
                   "--sigma-um / --opening-um 으로 지정하시면 기준이 같아집니다.")
 
     forced = None
-    if base.threshold_mode == "otsu_batch":
+    if base.threshold_mode in ("otsu_batch", "otsu3_batch"):
         def grays():
             for path, p in plans:
                 yield load_gray(path, p.crop_bottom_px, p.crop_top_px)
@@ -147,7 +159,8 @@ def main(argv=None):
               f"{', 대비 정규화' if p.normalize_contrast else ''}"
               f", 이 이미지의 Otsu {res.otsu_threshold:.3f})")
         print(f"  밝기 분리도    {res.separability:.3f}  "
-              f"(동적 범위 {res.dynamic_range:.3f}, 계조 {res.gray_levels}단계)")
+              f"(동적 범위 {res.dynamic_range:.3f}, 계조 {res.gray_levels}단계)   "
+              f"Otsu 2계급 {res.otsu_threshold:.3f} / 3계급 {res.otsu3_threshold:.3f}")
         print(f"  유효 Pore 개공율 {100*res.open_pore_fraction:.2f} %   <-- 주 지표")
         print(f"  Pore 개공율    {100*res.total_pore_fraction:.2f} % "
               f"(= 유효 {100*res.open_pore_fraction:.2f} + "
@@ -163,6 +176,12 @@ def main(argv=None):
         print(f"  등가직경 중앙값 {res.eqdiam_median_um:.2f} µm")
         print(f"  제외: 소형 {res.n_rejected_small}, 프레임접촉 {res.n_rejected_border} "
               f"(면적 {100*res.border_area_fraction:.1f} %)")
+        print(f"  탈락(계산 제외) {100*res.dropped_area_fraction:.1f} % "
+              f"(프레임접촉 {100*res.dropped_border_fraction:.1f}, "
+              f"소형 {100*res.dropped_small_fraction:.1f})   "
+              f"암부 덩어리 {res.n_blobs_before_split}"
+              + (f" -> 분리 후 {res.n_blobs_after_split}"
+                 if res.n_blobs_after_split != res.n_blobs_before_split else ""))
         for w in res.warnings:
             print(f"  [주의] {w}")
 
