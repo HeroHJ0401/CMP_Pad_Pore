@@ -354,10 +354,117 @@ def main():
         pump(root, 3)
     app.var_objectify.set("연결 성분")
 
+    # ----------------------------------------- objectify: greying and example
+    print("\n객체화 부속 동작")
+    check("임계 모드는 셋뿐이다 (3계급 제거)",
+          len(G.THRESHOLD_MODES) == 3 and
+          not any("3계급" in n for n, _k in G.THRESHOLD_MODES),
+          str([n for n, _k in G.THRESHOLD_MODES]))
+
+    ent_t = app.param_entries["terrain_depth"]
+    ent_d = app.param_entries["split_depth_um"]
+    app.var_objectify.set("연결 성분"); app._on_objectify_change(); pump(root, 3)
+    check("연결 성분이면 두 깊이 칸 모두 잠긴다",
+          str(ent_t.cget("state")) == "disabled"
+          and str(ent_d.cget("state")) == "disabled")
+    app.var_objectify.set("지형 분할"); app._on_objectify_change(); pump(root, 3)
+    check("지형 분할이면 지형 깊이만 열린다",
+          str(ent_t.cget("state")) == "normal"
+          and str(ent_d.cget("state")) == "disabled")
+    app.var_objectify.set("거리 분할"); app._on_objectify_change(); pump(root, 3)
+    check("거리 분할이면 분리 깊이만 열린다",
+          str(ent_d.cget("state")) == "normal"
+          and str(ent_t.cget("state")) == "disabled")
+    app.var_objectify.set("지형 분할"); app._on_objectify_change(); pump(root, 3)
+
+    # the list column must follow the global value, or it reads as "not applied"
+    app.v["terrain_depth"].set("0.11")
+    pump(root, 4)
+    cell_txt = app.flist.item(good, "values")[2]
+    check("기본값을 바꾸면 목록의 지형깊이도 따라간다",
+          "0.11" in str(cell_txt), str(cell_txt))
+
+    # the per-image dialog, the same shape as the pixel-size one
+    app.flist.selection_set(good)
+    pump(root, 3)
+    dlg = G._TerrainDepthDialog(app, [good])
+    dlg.var.set("0.15")
+    dlg._apply()
+    pump(root, 4)
+    check("대화상자가 이 이미지에만 값을 넣는다",
+          abs(app._depth_for(good) - 0.15) < 1e-9
+          and abs(app._depth_for(empty) - 0.11) < 1e-9,
+          f"{app.depth_info}")
+    check("목록에 괄호 없이 표시된다",
+          str(app.flist.item(good, "values")[2]).strip() == "0.15",
+          str(app.flist.item(good, "values")[2]))
+    dlg2 = G._TerrainDepthDialog(app, [good])
+    dlg2._clear()
+    pump(root, 4)
+    check("'기본값 따르기'가 되돌린다",
+          good not in app.depth_info
+          and abs(app._depth_for(good) - 0.11) < 1e-9)
+    app.v["terrain_depth"].set("0.08")
+    app.var_objectify.set("연결 성분"); app._on_objectify_change(); pump(root, 3)
+
+    # the worked example that the 객체화 tooltip shows
+    panels = app._objectify_panels()
+    check("객체화 툴팁 예시가 세 장 만들어진다", len(panels) == 3, str(len(panels)))
+    check("예시마다 방식 이름과 수치가 붙는다",
+          all(any(k in cap for k in ("연결 성분", "거리 분할", "지형 분할"))
+              and "Pore" in cap for _img, cap in panels),
+          str([c.splitlines()[0] for _i, c in panels]))
+    caps = [c.splitlines()[0] for _i, c in panels]
+    check("세 방식이 모두 나온다",
+          caps == ["연결 성분", "거리 분할", "지형 분할"], str(caps))
+
+    # ---------------------------------------------------- appearance + hover
+    print("\n모양과 요약 호버")
+    import tkinter.font as tkfont
+    fams = {f.lower() for f in tkfont.families(root)}
+    check("해석된 폰트가 실제로 설치되어 있다",
+          app.font_family == "TkDefaultFont" or app.font_family.lower() in fams,
+          app.font_family)
+    check("창 배경이 거의 흰색이다",
+          str(root.cget("background")) == G.UI_BG, str(root.cget("background")))
+    st = ttk.Style()
+    big = str(st.lookup("Big.TLabel", "font"))
+    check("제목은 본문보다 크고 굵다 (option_add가 덮어쓰지 않는다)",
+          "16" in big and "bold" in big and app.lbl_big.winfo_reqheight() > 24,
+          f"{big} / h={app.lbl_big.winfo_reqheight()}")
+
+    # the grey block is gone; its content has to be reachable on hover
+    check("회색 요약 블록이 사라졌다", not hasattr(app, "lbl_sub"))
+    res0 = app.results.get(good)
+    detail = app._detail_text(res0)
+    for must in ("Pore 개공율", "임계", "밝기 분리도", "시야", "탈락"):
+        check(f"호버 설명에 '{must}'가 있다", must in detail)
+    seen_big = {}
+    real_show = app.tip._show
+    app.tip._show = lambda text, x, y, panels_fn=None: seen_big.__setitem__("t", text)
+    app.tip.hide()
+    app.tree.selection_set(good)
+    pump(root, 3)
+    ev2 = type("E", (), {"x_root": 100, "y_root": 100})()
+    app._show_big_tip(ev2)
+    got = False
+    for _ in range(80):
+        pump(root, 4)
+        if seen_big.get("t"):
+            got = True
+            break
+    check("제목에 마우스를 올리면 설명이 뜬다",
+          got and "Pore 개공율" in seen_big.get("t", ""),
+          repr(seen_big.get("t", ""))[:40])
+    app.tip._show = real_show
+    app.tip.hide()
+
     # ------------------------------------------------------------ tooltips
     print("\n열 머리글 툴팁")
     shown = {}
-    app.tip._show = lambda text, x, y: shown.__setitem__("text", text)
+    app.tip._show = lambda text, x, y, panels_fn=None: (
+        shown.__setitem__("text", text),
+        shown.__setitem__("panels", panels_fn))
 
     def wait_tip(limit=80):
         for _ in range(limit):          # the tooltip is deliberately delayed

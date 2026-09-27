@@ -213,46 +213,6 @@ def main():
                    abs(r_real.norm_low_pct_used - 1.0) < 1e-9
                    and not any("하위 기준" in w for w in r_real.warnings)))
 
-    # ---- three brightness populations need three classes ----------------
-    # A worn surface holds deep pores, mid-grey shadow and bright matrix. Two-
-    # class Otsu must draw one line through that and puts it between shadow and
-    # matrix, so the shadow is scored as pore and fuses everything it touches.
-    # Here the truth is known: pores at 0.20, shadow at 0.45, matrix at 0.80.
-    rng3 = np.random.default_rng(17)
-    three = np.full((300, 400), 0.80)
-    three[:, :160] = 0.45                                 # the mid-grey band
-    yy3, xx3 = np.ogrid[:300, :400]
-    for cy, cx in ((70, 70), (150, 90), (220, 60), (90, 300), (200, 330)):
-        three[((yy3 - cy) ** 2 + (xx3 - cx) ** 2) <= 30 ** 2] = 0.20
-    three = np.clip(three + rng3.normal(0, 0.02, three.shape), 0, 1)
-    p2 = Params(pixel_size_um=0.5, min_diam_um=1.0, threshold_mode="otsu")
-    r2c = analyze_array(three, p2)
-    r3c = analyze_array(three, p2.copy_with(threshold_mode="otsu3"))
-    checks.append(("2-class Otsu lands between shadow and matrix",
-                   0.45 < r2c.effective_threshold < 0.80))
-    checks.append(("3-class Otsu lands between pore and shadow",
-                   0.20 < r3c.effective_threshold < 0.45))
-    checks.append(("so 2-class calls far more of the field dark",
-                   r2c.dark_area_fraction > 2 * r3c.dark_area_fraction))
-    checks.append(("the threshold's origin is reported",
-                   r2c.threshold_source == "Otsu(이미지별)"
-                   and r3c.threshold_source == "Otsu3(이미지별)"))
-    checks.append(("both reference thresholds are always available",
-                   np.isfinite(r2c.otsu_threshold) and np.isfinite(r2c.otsu3_threshold)
-                   and r2c.otsu3_threshold < r2c.otsu_threshold))
-    # the batch form has to keep the order-independence the 2-class one has
-    imgs3 = [three, np.clip(three * 0.85 + 0.05, 0, 1),
-             np.clip(three * 1.1 - 0.04, 0, 1)]
-    pb3 = Params(normalize_contrast=True, threshold_mode="otsu3_batch")
-    seen3 = {round(pooled_otsu((imgs3[i] for i in order), pb3), 12)
-             for order in itertools.permutations(range(3))}
-    checks.append(("3-class batch Otsu is identical for every file order",
-                   len(seen3) == 1))
-    checks.append(("3-class batch agrees with the single-image value on one image",
-                   abs(pooled_otsu([three], Params(threshold_mode="otsu3_batch"))
-                       - analyze_array(three, p2.copy_with(threshold_mode="otsu3")
-                                       ).effective_threshold) < 0.01))
-
     # ---- fused pores must be separable, and only when asked -------------
     # Thin dark bridges between asperities fuse visually separate pores into one
     # blob. The fused blob is deeply concave, so it scores invalid, and if it

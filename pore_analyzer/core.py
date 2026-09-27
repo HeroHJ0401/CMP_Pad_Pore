@@ -28,7 +28,7 @@ __all__ = ["Params", "Result", "analyze_path", "analyze_array",
            "robustness_sweep", "detect_bands", "load_gray",
            "prepare", "pooled_otsu", "unique_labels",
            "normalization_window", "contrast_report", "otsu_separability",
-           "split_merged", "multiotsu_low", "objectify_mask"]
+           "split_merged", "objectify_mask"]
 
 
 # --------------------------------------------------------------------------
@@ -55,10 +55,6 @@ class Params:
     #   threshold_mode      "fixed"      -> use `threshold` as given
     #                       "otsu"        -> pick it per image
     #                       "otsu_batch"  -> pick ONE from all images together
-    #                       "otsu3"       -> 3-class Otsu, lower threshold, per
-    #                                        image; for surfaces whose grey
-    #                                        levels form three populations
-    #                       "otsu3_batch" -> the same, one value for the batch
     normalize_contrast: bool = False
     threshold_mode: str = "fixed"
     norm_low_pct: float = 1.0         # percentile mapped to 0 when normalizing
@@ -171,7 +167,6 @@ class Result:
     mean_convex_deficiency: float = float("nan")
 
     otsu_threshold: float = float("nan")    # this image's own Otsu value
-    otsu3_threshold: float = float("nan")   # lower of its 3-class thresholds
     effective_threshold: float = float("nan")  # what was actually applied
     threshold_source: str = ""              # 고정 / Otsu(이미지별) / Otsu(일괄)
     separability: float = float("nan")      # Otsu eta on the prepared image
@@ -226,7 +221,6 @@ class Result:
             "effective_threshold": _r(self.effective_threshold, 4),
             "threshold_source": self.threshold_source,
             "otsu_threshold_ref": _r(self.otsu_threshold, 3),
-            "otsu3_threshold_ref": _r(self.otsu3_threshold, 3),
             "separability": _r(self.separability, 3),
             "dynamic_range": _r(self.dynamic_range, 3),
             "gray_levels": self.gray_levels,
@@ -508,65 +502,6 @@ def _otsu_from_hist(counts: np.ndarray, centers: np.ndarray) -> float:
     return float(centers[int(np.argmax(var))])
 
 
-MULTI_NBINS = 1024          # pair search is O(nbins^2), so a coarser grid
-
-
-def _multiotsu_from_hist(counts: np.ndarray, centers: np.ndarray) -> tuple:
-    """
-    Otsu's method extended to three classes: the pair of thresholds maximizing
-    the between-class variance, found by an exhaustive vectorized search.
-
-    Why three. A worn pad surface holds three brightness populations, not two:
-    the deep pores, the mid-grey shadow of the roughened ligaments, and the
-    bright matrix. Two-class Otsu has to draw ONE line through that and puts it
-    between mid-grey and bright, so the shadow joins the pores — on a real
-    image it called 49 % of the field dark and fused it into a mass covering
-    19.7 % of the frame. The lower of the three-class thresholds lands between
-    pore and shadow instead: 0.357 against the 0.34 that matched the eye, and
-    the largest blob fell to 2.6 %.
-
-    Agreement with skimage.filters.threshold_multiotsu was within 0.001 on the
-    same histogram; implemented here so a frozen build cannot drift with the
-    scikit-image version.
-    """
-    counts = np.asarray(counts, dtype=np.float64)
-    total = counts.sum()
-    if total <= 0 or counts.size < 3:
-        return (float("nan"), float("nan"))
-    pr = counts / total
-    w = np.cumsum(pr)
-    m = np.cumsum(pr * centers)
-    w0 = w[:, None]
-    w1 = w[None, :] - w[:, None]
-    w2 = 1.0 - w[None, :]
-    m0 = m[:, None]
-    m1 = m[None, :] - m[:, None]
-    m2 = m[-1] - m[None, :]
-    n = pr.size
-    ok = (np.arange(n)[None, :] > np.arange(n)[:, None])
-    ok &= (w0 > 1e-12) & (w1 > 1e-12) & (w2 > 1e-12)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        score = (m0 ** 2 / np.maximum(w0, 1e-300)
-                 + m1 ** 2 / np.maximum(w1, 1e-300)
-                 + m2 ** 2 / np.maximum(w2, 1e-300))
-    score = np.where(ok, score, -1.0)
-    score = np.nan_to_num(score, nan=-1.0, posinf=-1.0, neginf=-1.0)
-    if not np.any(score > 0):
-        return (float("nan"), float("nan"))
-    a, b = np.unravel_index(int(np.argmax(score)), score.shape)
-    return float(centers[a]), float(centers[b])
-
-
-def multiotsu_low(sm: np.ndarray, nbins: int = MULTI_NBINS) -> float:
-    """The lower of the two three-class thresholds, for one prepared image."""
-    sm = np.asarray(sm).ravel()
-    if sm.size == 0:
-        return float("nan")
-    edges = np.linspace(0.0, 1.0, int(nbins) + 1)
-    counts, _ = np.histogram(sm, bins=edges)
-    return _multiotsu_from_hist(counts, 0.5 * (edges[:-1] + edges[1:]))[0]
-
-
 def pooled_otsu(grays, p: Params, nbins: int = POOLED_NBINS) -> float:
     """
     One Otsu threshold computed from several images at once.
@@ -592,8 +527,7 @@ def pooled_otsu(grays, p: Params, nbins: int = POOLED_NBINS) -> float:
         2048x1536 field would outvote a 1024x768 one four to one in setting a
         threshold that is then applied to both.
     """
-    three = str(p.threshold_mode).startswith("otsu3")
-    nbins = MULTI_NBINS if three else max(2, int(nbins))
+    nbins = max(2, int(nbins))
     edges = np.linspace(0.0, 1.0, nbins + 1)
     centers = 0.5 * (edges[:-1] + edges[1:])
     hist = np.zeros(nbins, dtype=np.float64)
@@ -607,8 +541,6 @@ def pooled_otsu(grays, p: Params, nbins: int = POOLED_NBINS) -> float:
         n_img += 1
     if n_img == 0:
         return float("nan")
-    if three:
-        return _multiotsu_from_hist(hist, centers)[0]
     return _otsu_from_hist(hist, centers)
 
 
@@ -645,21 +577,13 @@ def analyze_array(gray: np.ndarray, p: Params, source: str = "",
         res.otsu_threshold = float(filters.threshold_otsu(sm))
     except Exception:
         res.otsu_threshold = float("nan")
-    try:
-        res.otsu3_threshold = multiotsu_low(sm)
-    except Exception:
-        res.otsu3_threshold = float("nan")
 
     if forced_threshold is not None:
         thr = float(forced_threshold)
-        res.threshold_source = ("Otsu3(일괄)" if str(p.threshold_mode).startswith("otsu3")
-                                else "Otsu(일괄)")
+        res.threshold_source = "Otsu(일괄)"
     elif p.threshold_mode == "otsu":
         thr = res.otsu_threshold
         res.threshold_source = "Otsu(이미지별)"
-    elif p.threshold_mode == "otsu3":
-        thr = res.otsu3_threshold
-        res.threshold_source = "Otsu3(이미지별)"
     else:                                  # "fixed", and the batch modes
         thr = p.threshold                  # without a pooled value supplied
         res.threshold_source = "고정"
@@ -672,9 +596,8 @@ def analyze_array(gray: np.ndarray, p: Params, source: str = "",
     if np.isfinite(res.separability) and res.separability < p.min_separability:
         res.warnings.append(
             f"밝기 분리도 {res.separability:.2f} (<{p.min_separability:.2f}) — "
-            "두 계급으로 갈라지지 않는 이미지입니다. 밝기 무리가 셋이라 "
-            "그럴 수 있으니 임계 모드를 'Otsu(3계급)'으로 두고 비교해 "
-            "보십시오. 그래도 낮으면 이 행의 개공율은 신뢰하지 마십시오.")
+            "두 계급으로 뚜렷하게 갈라지지 않는 이미지입니다. 임계값이 "
+            "사실상 임의로 정해지므로 이 행의 개공율은 신뢰하지 마십시오.")
     if res.gray_levels and res.gray_levels < 12:
         res.warnings.append(
             f"정규화 구간의 계조가 {res.gray_levels}단계뿐입니다 — "

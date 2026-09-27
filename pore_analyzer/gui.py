@@ -44,6 +44,46 @@ CONCAVE = "#e74c3c"     # solidity <  cut  -> excluded
 DROP_BORDER = "#3498db"   # dropped: the object reaches the frame
 DROP_SMALL = "#9b59b6"    # dropped: under the minimum equivalent diameter
 PANEL_W = 460           # preview panel width; also the label wrap width
+
+# ---------------------------------------------------------------- 모양
+# Near-white window. The old clam grey made every panel look like a dialog.
+UI_BG = "#f7f7f8"
+UI_FIELD = "#ffffff"
+UI_LINE = "#d7d9de"
+
+# Nanum Gothic Light where it exists, and something Korean-capable where it
+# does not. A "light" weight is a family of its own to Tk — it has no weight
+# axis beyond normal/bold — so each spelling has to be tried by name. The
+# spellings differ by installer: Naver's package, Google Fonts and the Linux
+# fonts-nanum packages all name the face differently, hence the long list.
+FONT_CANDIDATES = [
+    "NanumGothic Light", "NanumGothicLight", "나눔고딕 Light", "나눔고딕라이트",
+    "Nanum Gothic Light",
+    "NanumBarunGothic Light", "NanumBarunGothicLight", "나눔바른고딕 Light",
+    "NanumGothic", "나눔고딕", "Nanum Gothic",
+    "NanumBarunGothic", "나눔바른고딕",
+    "Apple SD Gothic Neo", "Malgun Gothic", "맑은 고딕",
+    "Segoe UI", "Helvetica", "TkDefaultFont",
+]
+
+
+def resolve_font(root):
+    """
+    First installed family from FONT_CANDIDATES, plus whether the request for a
+    Light face was met. A frozen build cannot ship system fonts, so a missing
+    font must degrade quietly — but not silently, or the user retypes the
+    setting wondering why nothing changed.
+    """
+    try:
+        from tkinter import font as tkfont
+        have = {f.lower(): f for f in tkfont.families(root)}
+    except Exception:
+        return "TkDefaultFont", False
+    for name in FONT_CANDIDATES:
+        hit = have.get(name.lower())
+        if hit:
+            return hit, ("light" in name.lower() or "라이트" in name)
+    return "TkDefaultFont", False
 APP_NAME = "CMP Pad 개공율 분석기_정현진"
 
 # ============================================================================
@@ -80,7 +120,6 @@ COLUMNS = [
     ("effective_threshold",       "적용 임계",          78),
     ("threshold_source",          "임계 출처",          104),
     ("otsu_threshold_ref",        "Otsu(참고)",         84),
-    ("otsu3_threshold_ref",       "Otsu3(참고)",        90),
     ("separability",              "밝기 분리도",        88),
     ("dynamic_range",             "동적 범위",          80),
     ("gray_levels",               "계조 수",            68),
@@ -206,16 +245,6 @@ COL_HELP = {
         "다르며, 'Otsu(일괄)'에서는 모든 이미지가 같은 값을 갖습니다.\n\n"
         "두 조건을 비교하실 때는 이 열의 값이 서로 같은지 반드시 확인하십시오. "
         "값이 다르면 개공율 차이에 임계값 차이가 섞여 들어갑니다.",
-    "otsu3_threshold_ref":
-        "이 이미지 한 장으로 산출한 **3계급 Otsu의 낮은 쪽** 임계값입니다. "
-        "모드가 'Otsu 3계급'일 때 실제로 쓰이고, 그 외에는 참고용입니다.\n\n"
-        "옆의 'Otsu(참고)'와 크게 벌어져 있으면, 이 이미지의 밝기가 두 무리가 "
-        "아니라 세 무리(깊은 Pore / 중간 회색 그림자 / 밝은 기지)라는 뜻입니다. "
-        "실제 패드 이미지에서 2계급은 0.486, 3계급 낮은 쪽은 0.359였고, 눈으로 "
-        "맞춘 값은 0.34였습니다.\n\n"
-        "'밝기 분리도'가 0.70 아래인데 이 두 값이 벌어져 있다면 3계급 모드를 "
-        "먼저 시도해 보십시오.",
-
     "otsu_threshold_ref":
         "이 이미지 한 장만으로 산출한 Otsu 임계값입니다. 모드가 "
         "'Otsu(이미지별)'일 때만 실제로 쓰이고, 그 외에는 참고용입니다.\n\n"
@@ -354,22 +383,17 @@ OBJECTIFY_MODES = [
 
 OBJECTIFY_HELP = (
     "어두운 픽셀을 어떻게 '하나의 Pore'로 묶을지입니다. 임계값과는 별개의 "
-    "결정이고, 이 둘을 한 덩어리로 묶어 둔 것이 문제였습니다.\n\n"
-    "• 연결 성분 — 이진화 마스크에서 서로 이어진 픽셀을 한 객체로 봅니다. "
-    "가장 단순하지만 임계값에 완전히 종속됩니다. 임계가 조금만 높아 Pore 사이 "
-    "회색이 암부에 들어오면 수십 개가 한 덩어리가 됩니다. 실제 이미지에서 "
-    "덩어리 하나가 시야의 19.7 %를 차지했습니다.\n\n"
-    "• 거리 분할 — 마스크의 모양만 보고 목이 좁은 곳을 자릅니다. 좁은 목에는 "
-    "듣지만 넓은 회색으로 이어진 경우에는 듣지 않습니다. 같은 이미지에서 최대 "
-    "객체가 1.5 %까지만 내려갔습니다.\n\n"
-    "• 지형 분할 — 회색 이미지 자체를 지형으로 봅니다. Pore 하나하나가 분지이고, "
-    "'지형 깊이'보다 깊은 웅덩이를 씨앗으로 삼아 물을 채워 능선(리가먼트)에서 "
-    "경계를 긋습니다. 그 능선이 임계값을 넘었는지와 무관합니다. 그래서 임계가 "
-    "나빠도 객체는 제대로 갈라집니다 — 잘못된 2계급 임계를 그대로 두고 이것만 "
-    "바꿨을 때 최대 객체 19.7 % → 0.53 %, 프레임에 삼켜진 면적 40.7 % → 5.1 %였습니다.\n\n"
-    "지형 분할은 객체 수를 크게 늘립니다(같은 이미지에서 182 → 334개). 얕은 "
-    "요철까지 각각 세기 때문입니다. '지형 깊이'로 조절하시고, 밀도와 개수를 "
-    "조건 간 비교에 쓰신다면 같은 값으로 맞추셔야 합니다."
+    "결정입니다. 위 세 그림은 지금 선택하신 이미지의 가운데 부분을 세 방식으로 "
+    "각각 분할한 것입니다.\n\n"
+    "• 연결 성분 — 이진화 마스크에서 이어진 픽셀이 한 객체. 임계에 완전히 "
+    "종속되어, 임계가 조금만 높으면 Pore 사이 회색이 암부에 들어와 수십 개가 "
+    "한 덩어리가 됩니다.\n"
+    "• 거리 분할 — 마스크의 모양만 보고 좁은 목을 자릅니다. 넓은 회색으로 "
+    "이어진 경우에는 듣지 않습니다.\n"
+    "• 지형 분할 — 회색 이미지를 지형으로 보고, 능선(리가먼트)에서 자릅니다. "
+    "능선이 임계를 넘었는지와 무관합니다.\n\n"
+    "지형 분할은 객체 수를 크게 늘립니다. 개수·밀도를 조건 간 비교에 쓰신다면 "
+    "'지형 깊이'를 양쪽에 맞추십시오."
 )
 
 # --------------------------------------------------------------- 임계 모드
@@ -377,8 +401,6 @@ THRESHOLD_MODES = [
     ("고정", "fixed"),
     ("Otsu (이미지별)", "otsu"),
     ("Otsu (일괄)", "otsu_batch"),
-    ("Otsu 3계급 (이미지별)", "otsu3"),
-    ("Otsu 3계급 (일괄)", "otsu3_batch"),
 ]
 
 MODE_HELP = (
@@ -506,22 +528,26 @@ CHECK_HELP = {
 class Tooltip:
     """One reusable popup. `show` is idempotent for the same key."""
 
-    def __init__(self, root, delay=400, wraplength=420):
+    def __init__(self, root, delay=400, wraplength=420, family="Segoe UI"):
         self.root = root
+        self.family = family
         self.delay = delay
         self.wraplength = wraplength
         self._win = None
         self._after = None
         self._key = None
+        self._images = []
 
-    def request(self, key, text, x, y):
+    def request(self, key, text, x, y, panels_fn=None):
         if key == self._key:
             return                       # already showing / already scheduled
         self.hide()
         self._key = key
-        self._after = self.root.after(self.delay, lambda: self._show(text, x, y))
+        self._after = self.root.after(
+            self.delay, lambda: self._show(text, x, y, panels_fn))
 
     def hide(self):
+        self._images = []
         if self._after is not None:
             try:
                 self.root.after_cancel(self._after)
@@ -536,7 +562,7 @@ class Tooltip:
             self._win = None
         self._key = None
 
-    def _show(self, text, x, y):
+    def _show(self, text, x, y, panels_fn=None):
         self._after = None
         win = tk.Toplevel(self.root)
         win.wm_overrideredirect(True)
@@ -546,9 +572,35 @@ class Tooltip:
             pass
         frm = tk.Frame(win, background="#2b2b2b", borderwidth=0)
         frm.pack()
-        tk.Label(frm, text=text, justify="left", wraplength=self.wraplength,
+
+        # Some settings are far easier to see than to read about. A panel
+        # provider returns [(PhotoImage, caption), ...] rendered from the
+        # user's OWN image, lazily — nothing is computed until a hover.
+        wrap = self.wraplength
+        if panels_fn is not None:
+            try:
+                panels = panels_fn()
+            except Exception:
+                panels = None
+            if panels:
+                strip = tk.Frame(frm, background="#2b2b2b")
+                strip.pack(padx=10, pady=(10, 0))
+                self._images = [img for img, _cap in panels]   # keep them alive
+                for col, (img, cap) in enumerate(panels):
+                    cell = tk.Frame(strip, background="#2b2b2b")
+                    cell.grid(row=0, column=col,
+                              padx=(0 if col == 0 else 8, 0), sticky="n")
+                    tk.Label(cell, image=img, background="#2b2b2b",
+                             borderwidth=1, relief="solid").pack()
+                    tk.Label(cell, text=cap, background="#2b2b2b",
+                             foreground="#cfd6e4", font=(self.family, 8),
+                             justify="left").pack(anchor="w", pady=(3, 0))
+                win.update_idletasks()
+                wrap = max(self.wraplength, strip.winfo_reqwidth())
+
+        tk.Label(frm, text=text, justify="left", wraplength=wrap,
                  background="#2b2b2b", foreground="#f0f0f0",
-                 font=("Segoe UI", 9), padx=10, pady=8).pack()
+                 font=(self.family, 9), padx=10, pady=8).pack(anchor="w")
         win.update_idletasks()
 
         # keep the popup on screen
@@ -620,12 +672,29 @@ class _Spinner(tk.Canvas):
         self._job = self.after(interval, lambda: self._tick(interval))
 
 
-def attach_tip(widget, tooltip: Tooltip, text, key=None):
+def _example_patch(side=190):
+    """A small synthetic pad-like patch, used before any image is loaded."""
+    rng = np.random.default_rng(4)
+    img = np.full((side, side), 0.74)
+    yy, xx = np.ogrid[:side, :side]
+    for y, x in zip(rng.integers(0, side, 26), rng.integers(0, side, 26)):
+        r = int(rng.integers(7, 16))
+        y0, y1 = max(0, y - r), min(side, y + r + 1)
+        x0, x1 = max(0, x - r), min(side, x + r + 1)
+        d = np.sqrt((yy[y0:y1] - y) ** 2 + (xx[:, x0:x1] - x) ** 2)
+        prof = 1.0 / (1.0 + np.exp((d - r) / 1.6))
+        img[y0:y1, x0:x1] = img[y0:y1, x0:x1] * (1 - prof) + 0.26 * prof
+    # the grey shadow bridges that fuse pores under a plain threshold
+    img = np.minimum(img, 0.52 + 0.22 * rng.random((side, side)))
+    return np.clip(img + rng.normal(0, 0.02, img.shape), 0, 1)
+
+
+def attach_tip(widget, tooltip: Tooltip, text, key=None, panels_fn=None):
     """Static tooltip for one widget."""
     key = key or (str(widget), text[:24])
 
     def enter(e):
-        tooltip.request(key, text, e.x_root + 14, e.y_root + 18)
+        tooltip.request(key, text, e.x_root + 14, e.y_root + 18, panels_fn)
 
     def leave(_):
         tooltip.hide()
@@ -661,14 +730,22 @@ class App:
         self._busy = False
         self._paste_dir = None
         self._paste_seq = 0
-        self.tip = Tooltip(root)
-
+        self._obj_panel_key = None
+        self._obj_panels = []
         self._build_style()
+        self.tip = Tooltip(root, family=self.font_family)
+
         self._build_widgets()
         self._on_mode_change()
+        self._on_objectify_change()
         # Keep the "적용 임계" line honest while the number is being typed.
         self.v["threshold"].trace_add(
             "write", lambda *_: self._refresh_applied_threshold())
+        # The file list prints each image's effective depth, so it goes stale
+        # the moment the global one is retyped — which read as "my value did
+        # not apply".
+        self.v["terrain_depth"].trace_add(
+            "write", lambda *_: self._refresh_all_rows())
 
         # Paste bindings fire AFTER the Entry class binding, so text paste into
         # a parameter box still works; the handler checks where the focus is and
@@ -702,6 +779,12 @@ class App:
                 self.dnd_ok = False
         self._set_drop_hint()
 
+        if not self.font_is_light:
+            # Silence here would read as "the font setting did nothing".
+            self.status.config(
+                text=f"나눔고딕 Light를 찾지 못해 '{self.font_family}'로 표시합니다. "
+                     f"나눔고딕 Light를 설치하시면 다음 실행부터 자동 적용됩니다.")
+
         if initial_files:
             self._add_files(initial_files)
 
@@ -709,19 +792,41 @@ class App:
 
     # ------------------------------------------------------------------ UI
     def _build_style(self):
+        self.font_family, self.font_is_light = resolve_font(self.root)
+        fam = self.font_family
+        base = (fam, 10)
+
         s = ttk.Style()
         try:
             s.theme_use("clam")
         except tk.TclError:
             pass
-        s.configure("Treeview", rowheight=24)
-        s.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
-        s.configure("Hint.TLabel", foreground="#666")
-        s.configure("Big.TLabel", font=("Segoe UI", 15, "bold"))
-        s.configure("Legend.TLabel", font=("Segoe UI", 9))
-        s.configure("Warn.TLabel", foreground="#b8860b", font=("Segoe UI", 9))
-        s.configure("Bad.TLabel", foreground="#c0392b", font=("Segoe UI", 9, "bold"))
-        s.configure("Applied.TLabel", foreground="#1a5fb4", font=("Segoe UI", 9, "bold"))
+
+        self.root.configure(background=UI_BG)
+        # NOT option_add("*Font", ...): that writes the -font OPTION onto every
+        # ttk widget as it is created, which outranks the style and silently
+        # flattened the headline back to 10 pt. The handful of plain tk widgets
+        # that show text (the tooltip) are given a font explicitly instead.
+
+        s.configure(".", background=UI_BG, fieldbackground=UI_FIELD,
+                    bordercolor=UI_LINE, font=base)
+        for widget in ("TFrame", "TLabel", "TLabelframe", "TLabelframe.Label",
+                       "TCheckbutton", "TRadiobutton", "TButton", "TNotebook"):
+            s.configure(widget, background=UI_BG)
+        s.configure("TButton", font=base)
+        s.configure("TEntry", fieldbackground=UI_FIELD)
+        s.configure("TCombobox", fieldbackground=UI_FIELD)
+        s.map("TCombobox", fieldbackground=[("readonly", UI_FIELD)])
+
+        s.configure("Treeview", rowheight=24, background=UI_FIELD,
+                    fieldbackground=UI_FIELD, font=base)
+        s.configure("Treeview.Heading", font=(fam, 9, "bold"), background="#eceef1")
+        s.configure("Hint.TLabel", foreground="#6b7280", font=(fam, 9))
+        s.configure("Big.TLabel", font=(fam, 16, "bold"), foreground="#111827")
+        s.configure("Legend.TLabel", font=(fam, 9))
+        s.configure("Warn.TLabel", foreground="#b8860b", font=(fam, 9))
+        s.configure("Bad.TLabel", foreground="#c0392b", font=(fam, 9, "bold"))
+        s.configure("Applied.TLabel", foreground="#1a5fb4", font=(fam, 9, "bold"))
 
     def _build_widgets(self):
         outer = ttk.Frame(self.root, padding=8)
@@ -736,7 +841,7 @@ class App:
 
         # A table rather than a plain list: every image carries its own scale,
         # because a batch may mix magnifications.
-        fholder = tk.Frame(fbox, width=420, height=132)
+        fholder = tk.Frame(fbox, width=380, height=132, bg=UI_BG)
         fholder.pack_propagate(False)
         fholder.pack(side="left", fill="both", expand=True)
         self.flist = ttk.Treeview(fholder, columns=("name", "px", "depth", "src"),
@@ -754,7 +859,7 @@ class App:
         sb.pack(side="left", fill="y")
         self.flist.config(yscrollcommand=sb.set)
         self.flist.bind("<<TreeviewSelect>>", lambda e: self._show_preview())
-        self.flist.bind("<Double-1>", self._edit_pixel_size)
+        self.flist.bind("<Double-1>", self._on_flist_double)
         self.flist.tag_configure("unknown", foreground="#b8860b")
 
         fbtn = ttk.Frame(fbox)
@@ -768,6 +873,15 @@ class App:
         ttk.Button(fbtn, text="전체 비우기", command=self._clear).pack(fill="x", pady=2)
         b_px = ttk.Button(fbtn, text="픽셀 크기 지정…", command=self._edit_pixel_size)
         b_px.pack(fill="x", pady=(8, 2))
+        b_dep = ttk.Button(fbtn, text="지형 깊이 지정…", command=self._edit_depth)
+        b_dep.pack(fill="x", pady=2)
+        attach_tip(b_dep, self.tip,
+                   "선택한 이미지에만 지형 깊이를 따로 지정합니다. 목록의 "
+                   "'지형깊이' 칸을 더블클릭하셔도 같습니다.\n\n"
+                   "'기본값 따르기'를 누르면 분석 조건의 값으로 되돌아갑니다. "
+                   "목록에 괄호로 표시된 값이 기본값을 따르는 중이라는 뜻입니다.\n\n"
+                   "'객체화'가 '지형 분할'일 때만 쓰입니다.",
+                   key="btn:depthedit")
         attach_tip(b_px, self.tip,
                    "선택한 이미지의 픽셀 크기를 직접 입력하거나 스케일바로 "
                    "측정합니다. 표의 행을 더블클릭하셔도 같습니다.\n\n"
@@ -859,16 +973,21 @@ class App:
         cb3.pack(side="left", padx=(12, 0))
         attach_tip(cb3, self.tip, CHECK_HELP["phys"], key="chk:phys")
 
-        lab_obj = ttk.Label(mrow, text="객체화", cursor="question_arrow")
+        mrow2 = ttk.Frame(pbox)
+        mrow2.grid(row=7, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        lab_obj = ttk.Label(mrow2, text="객체화", cursor="question_arrow")
         lab_obj.pack(side="left", padx=(14, 6))
         self.var_objectify = tk.StringVar(value="연결 성분")
-        cmb_obj = ttk.Combobox(mrow, textvariable=self.var_objectify, state="readonly",
+        cmb_obj = ttk.Combobox(mrow2, textvariable=self.var_objectify, state="readonly",
                                width=13, values=[m[0] for m in OBJECTIFY_MODES])
         cmb_obj.pack(side="left")
-        attach_tip(lab_obj, self.tip, OBJECTIFY_HELP, key="objectify")
-        attach_tip(cmb_obj, self.tip, OBJECTIFY_HELP, key="objectify")
+        cmb_obj.bind("<<ComboboxSelected>>", lambda e: self._on_objectify_change())
+        attach_tip(lab_obj, self.tip, OBJECTIFY_HELP, key="objectify",
+                   panels_fn=self._objectify_panels)
+        attach_tip(cmb_obj, self.tip, OBJECTIFY_HELP, key="objectify",
+                   panels_fn=self._objectify_panels)
 
-        b_reco = ttk.Button(mrow, text="권장 설정", command=self._apply_recommended)
+        b_reco = ttk.Button(mrow2, text="권장 설정", command=self._apply_recommended)
         b_reco.pack(side="left", padx=(12, 0))
         attach_tip(b_reco, self.tip,
                    "조건 간 비교에 가장 안전한 조합으로 맞춥니다: "
@@ -892,7 +1011,7 @@ class App:
         # the Otsu modes, and without this line the only way to find that out was
         # to run the analysis and read a column at the far right of the table.
         trow = ttk.Frame(pbox)
-        trow.grid(row=7, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        trow.grid(row=8, column=0, columnspan=4, sticky="w", pady=(6, 0))
         self.lbl_thr = ttk.Label(trow, text="", style="Applied.TLabel",
                                  cursor="question_arrow")
         self.lbl_thr.pack(side="left")
@@ -901,14 +1020,14 @@ class App:
         self.var_border = tk.BooleanVar(value=True)
         self.var_autocrop = tk.BooleanVar(value=True)
         cb1 = ttk.Checkbutton(pbox, text="프레임 접촉 객체 제외", variable=self.var_border)
-        cb1.grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        cb1.grid(row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
         cb2 = ttk.Checkbutton(pbox, text="위·아래 단색 띠 자동 크롭", variable=self.var_autocrop)
-        cb2.grid(row=8, column=2, columnspan=2, sticky="w", pady=(6, 0))
+        cb2.grid(row=9, column=2, columnspan=2, sticky="w", pady=(6, 0))
         attach_tip(cb1, self.tip, CHECK_HELP["border"], key="chk:border")
         attach_tip(cb2, self.tip, CHECK_HELP["autocrop"], key="chk:autocrop")
 
         abox = ttk.Frame(pbox)
-        abox.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        abox.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         self.btn_run = ttk.Button(abox, text="분석 실행", command=self._run)
         self.btn_run.pack(side="left")
         ttk.Button(abox, text="CSV 저장", command=self._save_csv).pack(side="left", padx=4)
@@ -955,7 +1074,7 @@ class App:
 
         # A fixed-size holder caps what the table asks for; the horizontal
         # scrollbar below covers whatever does not fit.
-        holder = tk.Frame(tbox, width=520, height=240)
+        holder = tk.Frame(tbox, width=520, height=240, bg=UI_BG)
         holder.pack_propagate(False)
         holder.pack(side="top", fill="both", expand=True)
 
@@ -979,35 +1098,36 @@ class App:
 
         # Pack the text bottom-up FIRST so the canvas can never squeeze it off
         # the window; the canvas then takes whatever vertical space is left.
-        self.lbl_sub = ttk.Label(vbox, text="", style="Hint.TLabel", justify="left",
-                                 wraplength=PANEL_W - 10)
-        self.lbl_sub.pack(side="bottom", anchor="w", fill="x")
-        self.lbl_big = ttk.Label(vbox, text="유효 Pore 개공율 —", style="Big.TLabel")
+        self.lbl_big = ttk.Label(vbox, text="유효 Pore 개공율 —", style="Big.TLabel",
+                                 cursor="question_arrow")
         self.lbl_big.pack(side="bottom", anchor="w", pady=(6, 2))
+        # Everything that used to sit under this number as a grey block now
+        # lives on a hover: the panel is where the picture goes, and every line
+        # of caption came straight out of the picture's height.
+        self.lbl_big.bind("<Enter>", self._show_big_tip, add="+")
+        self.lbl_big.bind("<Leave>", lambda e: self.tip.hide(), add="+")
 
         legend = ttk.Frame(vbox)
-        legend.pack(side="bottom", anchor="w", fill="x", pady=(8, 2))
-        self._legend_swatch(legend, CONVEX, "유효 Pore — 개공율에 포함",
-                            "유효 Pore 원형도(solidity)가 기준값 이상인 Pore입니다. 이들의 면적 합이 "
-                            "유효 Pore 개공율의 분자가 됩니다.")
-        self._legend_swatch(legend, CONCAVE, "무효 Pore — 유효 개공율에서 제외",
-                            "유효 Pore 원형도가 기준값 미만인 Pore입니다. 무너진 asperity에 가려진 "
-                            "개구부나 표면 그림자가 대부분이라 유효 개공율에서 뺍니다.")
-        self._legend_swatch(legend, DROP_BORDER, "탈락 — 프레임에 닿아 제외",
-                            "이미지 경계에 닿아 계산에서 완전히 빠진 영역입니다. "
-                            "('프레임 접촉 객체 제외'를 끄면 빠지지 않습니다.)\n\n"
-                            "화면 한가운데가 이 색이어도 놀라지 마십시오. 하나의 객체가 "
-                            "가장자리에서 출발해 안쪽으로 길게 뻗을 수 있습니다. 실제 "
-                            "이미지에서 한 덩어리가 시야의 19.7 %를 차지하며 왼쪽 변에서 "
-                            "한가운데까지 닿은 적이 있습니다. 같은 색으로 이어져 있고 어딘가 "
-                            "가장자리에 닿아 있다면 전부 한 객체입니다.\n\n"
-                            "이 색이 넓으면 '붙은 Pore 분리'를 켜 보시거나, 임계값을 낮춰 "
-                            "그림자 다리를 끊으십시오.")
-        self._legend_swatch(legend, DROP_SMALL, "탈락 — 최소 등가직경 미만",
-                            "등가직경이 '최소 등가직경' 설정보다 작아 제외된 영역입니다.\n\n"
-                            "면적이 π × (최소 등가직경 ÷ 픽셀 크기 ÷ 2)² 픽셀보다 작으면 "
-                            "여기에 해당합니다. 이 색이 많으면 최소 등가직경을 낮추거나 "
-                            "픽셀 크기가 맞는지 확인하십시오.")
+        legend.pack(side="bottom", anchor="w", fill="x", pady=(6, 2))
+        for k, (color, label, help_text) in enumerate((
+            (CONVEX, "유효 Pore",
+             "유효 Pore 원형도(solidity)가 기준값 이상인 Pore입니다. 이들의 면적 합이 "
+             "유효 Pore 개공율의 분자가 됩니다."),
+            (CONCAVE, "무효 Pore",
+             "유효 Pore 원형도가 기준값 미만인 Pore입니다. 무너진 asperity에 가려진 "
+             "개구부나 표면 그림자가 대부분이라 유효 개공율에서 뺍니다. 버려지지는 "
+             "않으므로 'Pore 개공율'에는 그대로 들어갑니다."),
+            (DROP_BORDER, "탈락 — 프레임 접촉",
+             "이미지 경계에 닿아 계산에서 완전히 빠진 영역입니다.\n\n"
+             "화면 한가운데가 이 색이어도 놀라지 마십시오. 하나의 객체가 가장자리에서 "
+             "출발해 안쪽으로 길게 뻗을 수 있습니다. 같은 색으로 이어져 있고 어딘가 "
+             "가장자리에 닿아 있다면 전부 한 객체입니다."),
+            (DROP_SMALL, "탈락 — 최소직경 미만",
+             "등가직경이 '최소 등가직경'보다 작아 제외된 영역입니다. 면적이 "
+             "π × (최소 등가직경 ÷ 픽셀 크기 ÷ 2)² 픽셀보다 작으면 여기 해당합니다."),
+        )):
+            self._legend_swatch(legend, color, label, help_text,
+                                cell=(k // 2, k % 2))
 
         # The canvas's requested width is what sets this panel's width. Labels
         # therefore get a FIXED wraplength: deriving it from the panel width
@@ -1047,6 +1167,83 @@ class App:
                 except (ValueError, ZeroDivisionError):
                     pass
 
+    # ------------------------------------- worked example for the tooltip
+    def _objectify_panels(self):
+        """
+        Three thumbnails of the SAME patch objectified three ways, for the
+        객체화 tooltip.
+
+        Rendered from the user's own SEM image when one is loaded, because the
+        difference between these methods is not something a sentence conveys —
+        on a rough pad surface connected components fuse dozens of pores into
+        one mass while terrain separates them, and that is obvious at a glance
+        and obscure in prose. Falls back to a synthetic patch before any file
+        is added. Cached per source, and computed only on hover.
+        """
+        src = self._selected_path() or (self.files[0] if self.files else None)
+        if getattr(self, "_obj_panel_key", None) == src and self._obj_panels:
+            return self._obj_panels
+
+        SIDE = 190
+        try:
+            if src:
+                used = getattr(self.results.get(src), "used_params", None)
+                base = self._params() if used is None else used
+                if (base.crop_top_px == 0 and base.crop_bottom_px == 0
+                        and self.var_autocrop.get()):
+                    # before the first run there is no settled crop, and the
+                    # SEM data bar would otherwise dominate the example
+                    top, bot = detect_bands(load_gray(src))
+                    base = base.copy_with(crop_top_px=top, crop_bottom_px=bot)
+                gray = load_gray(src, base.crop_bottom_px, base.crop_top_px)
+                # The largest centred square, not a small patch: the
+                # difference between these methods is fusion across many pores,
+                # and a crop holding six of them shows nothing at all.
+                h, w = gray.shape
+                side = min(h, w)
+                r0, c0 = (h - side) // 2, (w - side) // 2
+                gray = gray[r0:r0 + side, c0:c0 + side]
+                p = base.copy_with(terrain_depth=self._depth_for(src))
+            else:
+                gray = _example_patch()
+                p = Params(pixel_size_um=1.0, min_diam_um=2.0,
+                           threshold_mode="otsu", normalize_contrast=True)
+        except Exception:
+            gray = _example_patch()
+            p = Params(pixel_size_um=1.0, min_diam_um=2.0,
+                       threshold_mode="otsu", normalize_contrast=True)
+
+        panels = []
+        for mode, name in (("cc", "연결 성분"), ("distance", "거리 분할"),
+                           ("terrain", "지형 분할")):
+            try:
+                res = analyze_array(gray, p.copy_with(objectify=mode))
+            except Exception:
+                continue
+            im = Image.fromarray(res.overlay).resize((SIDE, SIDE), Image.LANCZOS)
+            panels.append((ImageTk.PhotoImage(im),
+                           f"{name}\nPore {res.n_objects}개 · "
+                           f"유효 {100*res.open_pore_fraction:.1f} %\n"
+                           f"탈락 {100*res.dropped_border_fraction:.0f} %"))
+        self._obj_panel_key, self._obj_panels = src, panels
+        return panels
+
+    def _on_objectify_change(self):
+        """
+        Grey out the depth that the chosen method does not read.
+
+        Both boxes being live while only one is used is the same trap as the
+        threshold box in the Otsu modes: a number is typed, nothing changes,
+        and it looks like the setting is broken.
+        """
+        mode = self._objectify_key()
+        for key, active in (("split_depth_um", mode == "distance"),
+                            ("terrain_depth", mode == "terrain")):
+            ent = self.param_entries.get(key)
+            if ent is not None:
+                ent.config(state="normal" if active else "disabled")
+        self._check_mixed_scales()
+
     def _objectify_key(self) -> str:
         label = self.var_objectify.get()
         for name, key in OBJECTIFY_MODES:
@@ -1083,10 +1280,8 @@ class App:
             self.lbl_thr.config(
                 text=f"적용 임계  {self.v['threshold'].get()}  (입력하신 고정값)")
             return
-        name = ("Otsu(일괄) — 전체 공통 1개" if mode.endswith("_batch")
+        name = ("Otsu(일괄) — 전체 공통 1개" if mode == "otsu_batch"
                 else "Otsu(이미지별) — 이미지마다 다름")
-        if mode.startswith("otsu3"):
-            name = "3계급 " + name
         if not thrs:
             self.lbl_thr.config(
                 text=f"적용 임계  분석 실행 후 결정 · {name}"
@@ -1116,6 +1311,7 @@ class App:
         self.var_objectify.set("지형 분할")
         self.v["terrain_depth"].set("0.08")
         self._on_mode_change()
+        self._on_objectify_change()
         self.status.config(
             text="권장 설정 적용: 대비 정규화 + Otsu(일괄) + 지형 분할(깊이 0.08). "
                  "적용 임계는 아래 표시와 결과 표의 '적용 임계' 열에서 확인하십시오.")
@@ -1185,6 +1381,20 @@ class App:
         self.lbl_mixed.config(text="  ".join(parts))
         return len(scales) > 1
 
+    def _on_flist_double(self, event):
+        """Double-click edits whichever column was clicked."""
+        col = self.flist.identify_column(event.x)
+        if col == "#3":                      # the 지형깊이 column
+            return self._edit_depth()
+        return self._edit_pixel_size()
+
+    def _edit_depth(self, _event=None):
+        paths = list(self.flist.selection()) or (self.files[:1] if self.files else [])
+        if not paths:
+            messagebox.showinfo("이미지 없음", "먼저 이미지를 추가하고 선택하십시오.")
+            return
+        _TerrainDepthDialog(self, paths)
+
     def _edit_pixel_size(self, _event=None):
         paths = list(self.flist.selection()) or (self.files[:1] if self.files else [])
         if not paths:
@@ -1246,9 +1456,13 @@ class App:
             text="창에 파일을 끌어다 놓으셔도 됩니다" if self.dnd_ok
             else "이미지 추가 버튼을 사용하십시오")
 
-    def _legend_swatch(self, parent, color, label, help_text):
-        row = ttk.Frame(parent)
-        row.pack(side="top", anchor="w", fill="x", pady=1)
+    def _legend_swatch(self, parent, color, label, help_text, cell=None):
+        if cell is None:
+            row = ttk.Frame(parent)
+            row.pack(side="top", anchor="w", fill="x", pady=1)
+        else:
+            row = ttk.Frame(parent)
+            row.grid(row=cell[0], column=cell[1], sticky="w", padx=(0, 10), pady=1)
         sw = tk.Canvas(row, width=14, height=14, highlightthickness=1,
                        highlightbackground="#888", bg=color)
         sw.pack(side="left", padx=(0, 7))
@@ -1460,7 +1674,6 @@ class App:
         self._refresh_table()
         self.canvas.delete("all")
         self.lbl_big.config(text="유효 Pore 개공율 —")
-        self.lbl_sub.config(text="")
         self.lbl_mixed.config(text="")
         self.lbl_warn.config(text="")
         self.lbl_px_src.config(text="")
@@ -1546,7 +1759,7 @@ class App:
         # Pass 2: one threshold from all images, when that mode is selected.
         # A generator keeps only one image in memory at a time.
         forced = None
-        if p.threshold_mode in ("otsu_batch", "otsu3_batch"):
+        if p.threshold_mode == "otsu_batch":
             self._q.put(("status", "모든 이미지의 밝기 분포를 합쳐 공통 임계값 계산 중…"))
 
             def grays():
@@ -1768,7 +1981,7 @@ class App:
             cell.grid(row=(i // 3) * 2, column=i % 3, sticky="n")
             tk.Label(cell, image=img, borderwidth=1, relief="solid").pack()
             ttk.Label(cell, text=f"지형 깊이 {depth:.2f}",
-                      font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(4, 0))
+                      font=(self.font_family, 10, "bold")).pack(anchor="w", pady=(4, 0))
             ttk.Label(cell, style="Hint.TLabel", justify="left",
                       text=(f"유효 {100*res.open_pore_fraction:.1f} %  "
                             f"무효 {100*res.invalid_pore_fraction:.1f} %\n"
@@ -1789,6 +2002,7 @@ class App:
             def adopt_all(d=depth, w=win):
                 self.v["terrain_depth"].set(f"{d:g}")
                 self.var_objectify.set("지형 분할")
+                self._on_objectify_change()
                 self.depth_info.clear()
                 self._refresh_all_rows()
                 self.status.config(
@@ -1798,6 +2012,7 @@ class App:
             def adopt_one(d=depth, w=win, path=sel):
                 self.depth_info[path] = float(d)
                 self.var_objectify.set("지형 분할")
+                self._on_objectify_change()
                 self._refresh_all_rows()
                 self.status.config(
                     text=f"{os.path.basename(path)}에만 지형 깊이 {d:g} 적용 — "
@@ -1855,49 +2070,58 @@ class App:
         self.canvas.delete("all")
         self.canvas.create_image(cw // 2, ch // 2, image=self._preview_img, anchor="center")
 
-        used = getattr(res, "used_params", None)
-        crop_note = ""
-        if used is not None and (used.crop_top_px or used.crop_bottom_px):
-            crop_note = (f"자동 크롭 위 {used.crop_top_px} px / 아래 "
-                         f"{used.crop_bottom_px} px 적용 후 측정\n")
-
-        mode_note = ""
-        if used is not None:
-            norm = " · 대비 정규화" if used.normalize_contrast else ""
-            mode_note = (f"임계 {res.effective_threshold:.4f} "
-                         f"({res.threshold_source}{norm}) · "
-                         f"이 이미지의 Otsu {res.otsu_threshold:.3f}\n"
-                         f"밝기 분리도 {res.separability:.3f} · "
-                         f"동적 범위 {res.dynamic_range:.3f} · "
-                         f"계조 {res.gray_levels}단계\n")
-
-        warn_note = ""
-        if res.warnings:
-            warn_note = "\n⚠ " + "\n⚠ ".join(res.warnings)
-
+        # Only the headline is packed under the canvas now; everything else
+        # is on hover (_show_big_tip), so the picture keeps the panel.
         self.lbl_big.config(text=f"유효 Pore 개공율 {100*res.open_pore_fraction:.2f} %")
-        self.lbl_sub.config(text=(
+
+    def _detail_text(self, res) -> str:
+        """The full read-out for one image, shown on hover over the headline."""
+        used = getattr(res, "used_params", None)
+        lines = [
             f"Pore 개공율 {100*res.total_pore_fraction:.2f} % = "
             f"유효 {100*res.open_pore_fraction:.2f} % + "
-            f"무효 {100*res.invalid_pore_fraction:.2f} %\n"
+            f"무효 {100*res.invalid_pore_fraction:.2f} %",
             f"Pore {res.n_objects}개 · 유효 {100*res.valid_count_ratio:.0f} % · "
+            f"밀도 {res.object_density_per_mm2:.0f} /mm²",
             f"Pore 원형도 {res.circularity_median:.3f} · "
-            f"유효 Pore 원형도 {res.solidity_median:.3f}\n"
+            f"유효 Pore 원형도 {res.solidity_median:.3f} · "
+            f"등가직경 {res.eqdiam_median_um:.2f} µm",
+            "",
+            f"임계 {res.effective_threshold:.4f} ({res.threshold_source})"
+            + (" · 대비 정규화" if used is not None and used.normalize_contrast else "")
+            + f" · 이 이미지의 Otsu {res.otsu_threshold:.3f}",
+            f"밝기 분리도 {res.separability:.3f} · 동적 범위 {res.dynamic_range:.3f} · "
+            f"계조 {res.gray_levels}단계",
             f"시야 {res.field_w_um:.0f} × {res.field_h_um:.0f} µm "
-            f"({res.width_px} × {res.height_px} px)\n"
-            f"{mode_note}"
-            f"{crop_note}"
+            f"({res.width_px} × {res.height_px} px) · 픽셀 {res.pixel_size_um:.4g} µm",
+        ]
+        if used is not None and (used.crop_top_px or used.crop_bottom_px):
+            lines.append(f"자동 크롭 위 {used.crop_top_px} px / "
+                         f"아래 {used.crop_bottom_px} px 적용 후 측정")
+        lines += [
+            "",
             f"Pore 면적(필터전) {100*res.dark_area_fraction:.1f} % · "
-            f"Non-Pore 면적 {100*(1-res.dark_area_fraction):.1f} %\n"
-            f"프레임 접촉 제외 {res.n_rejected_border}개 "
-            f"(면적 {100*res.border_area_fraction:.1f} %) — 개공율은 그만큼 과소평가\n"
+            f"Non-Pore 면적 {100*(1-res.dark_area_fraction):.1f} %",
             f"탈락 {100*res.dropped_area_fraction:.1f} % "
-            f"(접촉 {100*res.dropped_border_fraction:.1f} · "
-            f"소형 {100*res.dropped_small_fraction:.1f}) · "
+            f"(프레임 접촉 {100*res.dropped_border_fraction:.1f} · "
+            f"최소직경 미만 {100*res.dropped_small_fraction:.1f})",
             f"암부 덩어리 {res.n_blobs_before_split}개"
-            + (f" → 분리 후 {res.n_blobs_after_split}개"
-               if res.n_blobs_after_split != res.n_blobs_before_split else "")
-            + f"{warn_note}"))
+            + (f" → 객체화 후 {res.n_blobs_after_split}개"
+               if res.n_blobs_after_split != res.n_blobs_before_split else ""),
+        ]
+        if res.warnings:
+            lines.append("")
+            lines += [f"⚠ {w}" for w in res.warnings]
+        return "\n".join(lines)
+
+    def _show_big_tip(self, event):
+        path = self._selected_path()
+        res = self.results.get(path) if path else None
+        if res is None:
+            return
+        self.tip.request(f"big:{path}:{res.effective_threshold}",
+                         self._detail_text(res),
+                         event.x_root + 14, event.y_root + 18)
 
     # -------------------------------------------------------------- save
     def _save_csv(self):
@@ -1945,6 +2169,96 @@ class App:
                 pass                       # fall back to the preview-sized one
         Image.fromarray(overlay).save(fp)
         self.status.config(text=f"오버레이 저장: {fp}  ({overlay.shape[1]}×{overlay.shape[0]} px)")
+
+
+class _TerrainDepthDialog:
+    """Set the terrain depth for the selected images, or clear it back to the
+    global value. Same shape as the pixel-size dialog because it is the same
+    kind of thing: a per-image override with a batch default behind it."""
+
+    def __init__(self, app, paths):
+        self.app = app
+        self.paths = paths
+        first = paths[0]
+
+        win = tk.Toplevel(app.root)
+        self.win = win
+        win.title("지형 깊이 지정")
+        win.transient(app.root)
+        win.resizable(False, False)
+
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        names = ", ".join(os.path.basename(p) for p in paths[:3])
+        more = f" 외 {len(paths)-3}개" if len(paths) > 3 else ""
+        ttk.Label(frm, text=f"대상: {names}{more}", wraplength=400,
+                  justify="left").pack(anchor="w")
+
+        own = app.depth_info.get(first)
+        ttk.Label(frm, style="Hint.TLabel", wraplength=400, justify="left",
+                  text=(f"현재 값: {own:g} (이 이미지 전용)" if own is not None
+                        else f"현재 값: {app._default_depth():g} — 기본값을 따르는 중")
+                  ).pack(anchor="w", pady=(2, 10))
+
+        row = ttk.Frame(frm)
+        row.pack(anchor="w")
+        ttk.Label(row, text="지형 깊이 (0–1)").pack(side="left", padx=(0, 6))
+        self.var = tk.StringVar(value=f"{own:g}" if own is not None
+                                else f"{app._default_depth():g}")
+        ttk.Entry(row, textvariable=self.var, width=12).pack(side="left")
+
+        ttk.Button(frm, text="이 이미지들로 미리 보기…", command=self._preview
+                   ).pack(anchor="w", pady=(10, 0))
+        ttk.Label(frm, style="Hint.TLabel", wraplength=400, justify="left",
+                  text=("첫 번째 이미지를 여러 깊이로 분할해 나란히 보여 드립니다. "
+                        "'객체화'가 '지형 분할'일 때만 이 값이 쓰입니다.")
+                  ).pack(anchor="w")
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(14, 0))
+        ttk.Button(btns, text="적용", command=self._apply).pack(side="right")
+        ttk.Button(btns, text="기본값 따르기", command=self._clear
+                   ).pack(side="right", padx=(0, 6))
+        ttk.Button(btns, text="취소", command=win.destroy).pack(side="right", padx=(0, 6))
+        win.bind("<Return>", lambda e: self._apply())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.update_idletasks()
+        win.geometry(f"+{app.root.winfo_rootx()+140}+{app.root.winfo_rooty()+140}")
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+    def _preview(self):
+        self.win.destroy()
+        self.app._compare_terrain()
+
+    def _clear(self):
+        for p in self.paths:
+            self.app.depth_info.pop(p, None)
+        self.app._refresh_all_rows()
+        self.app.status.config(
+            text=f"{len(self.paths)}개 이미지가 기본 지형 깊이를 따릅니다.")
+        self.win.destroy()
+
+    def _apply(self):
+        try:
+            value = float(self.var.get())
+        except ValueError:
+            messagebox.showerror("입력 오류", "숫자를 넣어 주십시오.", parent=self.win)
+            return
+        if not (0.0 < value < 1.0):
+            messagebox.showerror("입력 오류", "지형 깊이는 0과 1 사이여야 합니다.",
+                                 parent=self.win)
+            return
+        for p in self.paths:
+            self.app.depth_info[p] = value
+        self.app._refresh_all_rows()
+        self.app.status.config(
+            text=f"{len(self.paths)}개 이미지에 지형 깊이 {value:g} 적용 — "
+                 f"'분석 실행'을 다시 누르십시오.")
+        self.win.destroy()
 
 
 class _PixelSizeDialog:

@@ -31,7 +31,7 @@ def build_parser():
     ap.add_argument("--no-autocrop", action="store_true", help="위·아래 단색 띠 자동 크롭 비활성화")
     ap.add_argument("--keep-border", action="store_true", help="프레임 접촉 객체를 제외하지 않음")
     ap.add_argument("--mode",
-                    choices=["fixed", "otsu", "otsu-batch", "otsu3", "otsu3-batch"],
+                    choices=["fixed", "otsu", "otsu-batch"],
                     default="fixed",
                     help="임계 결정 방식 (기본 fixed). otsu-batch는 모든 이미지의 "
                          "밝기 분포를 합쳐 공통 임계값 하나를 적용")
@@ -128,7 +128,7 @@ def main(argv=None):
                   "--sigma-um / --opening-um 으로 지정하시면 기준이 같아집니다.")
 
     forced = None
-    if base.threshold_mode in ("otsu_batch", "otsu3_batch"):
+    if base.threshold_mode == "otsu_batch":
         def grays():
             for path, p in plans:
                 yield load_gray(path, p.crop_bottom_px, p.crop_top_px)
@@ -159,8 +159,7 @@ def main(argv=None):
               f"{', 대비 정규화' if p.normalize_contrast else ''}"
               f", 이 이미지의 Otsu {res.otsu_threshold:.3f})")
         print(f"  밝기 분리도    {res.separability:.3f}  "
-              f"(동적 범위 {res.dynamic_range:.3f}, 계조 {res.gray_levels}단계)   "
-              f"Otsu 2계급 {res.otsu_threshold:.3f} / 3계급 {res.otsu3_threshold:.3f}")
+              f"(동적 범위 {res.dynamic_range:.3f}, 계조 {res.gray_levels}단계)")
         print(f"  유효 Pore 개공율 {100*res.open_pore_fraction:.2f} %   <-- 주 지표")
         print(f"  Pore 개공율    {100*res.total_pore_fraction:.2f} % "
               f"(= 유효 {100*res.open_pore_fraction:.2f} + "
