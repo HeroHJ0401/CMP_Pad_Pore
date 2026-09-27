@@ -139,6 +139,80 @@ def main():
     checks.append(("count ratios sum to one",
                    abs(res.valid_count_ratio + res.concave_ratio - 1.0) < 1e-12))
 
+    # ---- batch Otsu must not depend on the order the files arrive in ------
+    # It used to: one shared random Generator subsampled each image, so the
+    # draw for image k depended on how many came before it. Reordering the same
+    # files moved the threshold and with it every reported number — worst on
+    # sets whose pooled histogram has a shallow optimum, which is exactly when
+    # the batch mode is reached for. Asserted as exact equality over every
+    # permutation, because a tolerance would let the bug back in.
+    import itertools
+    imgs = []
+    for gain, off in ((1.00, 0.00), (0.80, 0.06), (1.15, -0.05)):
+        imgs.append(np.clip(gray * gain + off, 0, 1))
+    pb = Params(normalize_contrast=True, threshold_mode="otsu_batch")
+    seen = {round(pooled_otsu((imgs[i] for i in order), pb), 12)
+            for order in itertools.permutations(range(len(imgs)))}
+    checks.append(("batch Otsu identical for every file order", len(seen) == 1))
+    # and equally weighted: blowing one image up to 4x the pixels must not let
+    # it outvote the others in a threshold that is then applied to all of them.
+    # Smoothing is off here on purpose — a Gaussian of a fixed pixel σ covers
+    # half the physical distance on a 2x-upscaled image and would change its
+    # histogram for real, which is a different effect from vote weighting.
+    pw = Params(normalize_contrast=True, threshold_mode="otsu_batch", sigma_px=0.0)
+    big = np.repeat(np.repeat(imgs[0], 2, axis=0), 2, axis=1)
+    checks.append(("batch Otsu weighs each image equally, not by pixel count",
+                   abs(pooled_otsu(iter(imgs), pw)
+                       - pooled_otsu(iter([big] + imgs[1:]), pw)) < 1e-9))
+
+    # ---- separability must flag an image Otsu cannot legitimately split ---
+    # Otsu returns a threshold for any input, including a field with no pores:
+    # it splits the noise and reports several percent out of nothing. eta is
+    # what separates "two real classes" from "one blob cut in half", and it has
+    # to stay high when contrast is merely low — otherwise it would just be
+    # restating contrast and would fire on sound low-contrast captures.
+    rng_s = np.random.default_rng(11)
+    blank = np.clip(0.72 + rng_s.normal(0, 0.015, gray.shape), 0, 1)
+    po = Params(threshold_mode="otsu", normalize_contrast=True)
+    r_real = analyze_array(gray, po)
+    r_blank = analyze_array(blank, po)
+    checks.append(("real pores are separable", r_real.separability > 0.80))
+    checks.append(("a pore-free field is flagged, not reported",
+                   r_blank.separability < po.min_separability
+                   and any("분리도" in w for w in r_blank.warnings)))
+    checks.append(("a sound image carries no warning", not r_real.warnings))
+    squashed = np.clip((gray - gray.mean()) * 0.06 + gray.mean(), 0, 1)
+    squashed = np.round(squashed * 255) / 255
+    r_low = analyze_array(squashed, po)
+    checks.append(("separability survives a 16x contrast squeeze",
+                   abs(r_low.separability - r_real.separability) < 0.05))
+    checks.append(("low contrast is reported as a dynamic range, not an error",
+                   r_low.dynamic_range < r_real.dynamic_range
+                   and r_low.gray_levels < r_real.gray_levels))
+
+    # ---- the normalization anchor must stay out of the dark population ----
+    # With the anchor at 1 % and pores covering less than that, the percentile
+    # lands in the bright matrix, matrix noise gets stretched across the range
+    # and every pore is clipped to 0: a field whose true value was 0.41 % read
+    # 5.16 %. The anchor is therefore held below the measured dark fraction.
+    sparse = np.full(gray.shape, 0.72)
+    yy, xx = np.ogrid[:gray.shape[0], :gray.shape[1]]
+    for cy, cx in ((40, 50), (90, 140), (150, 60)):
+        sparse[((yy - cy) ** 2 + (xx - cx) ** 2) <= 36] = 0.22
+    sparse = np.clip(sparse + np.random.default_rng(5).normal(0, 0.015, gray.shape), 0, 1)
+    true_dark = float((sparse < 0.45).mean())
+    r_sp = analyze_array(sparse, Params(threshold_mode="otsu", normalize_contrast=True,
+                                        min_diam_um=0.5))
+    checks.append(("sparse dark population lowers the normalization anchor",
+                   r_sp.norm_low_pct_used < 1.0
+                   and any("하위 기준" in w for w in r_sp.warnings)))
+    checks.append(("sparse field is not inflated by normalization",
+                   r_sp.total_pore_fraction < 4 * true_dark + 0.01))
+    # and the ordinary case must be untouched, so existing numbers still hold
+    checks.append(("an ordinary field keeps the anchor as configured",
+                   abs(r_real.norm_low_pct_used - 1.0) < 1e-9
+                   and not any("하위 기준" in w for w in r_real.warnings)))
+
     row = res.summary_row()
     checks.append(("CSV carries all three area fractions",
                    abs(row["valid_pore_fraction_pct"] + row["invalid_pore_fraction_pct"]

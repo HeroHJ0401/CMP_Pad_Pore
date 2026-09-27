@@ -12,6 +12,9 @@ from __future__ import annotations
 import os
 import sys
 import csv
+import atexit
+import shutil
+import tempfile
 import threading
 import traceback
 import queue
@@ -68,7 +71,11 @@ COLUMNS = [
     ("n_rejected_border",         "프레임접촉",         80),
     ("border_area_fraction_pct",  "접촉면적 %",         88),
     ("effective_threshold",       "적용 임계",          78),
+    ("threshold_source",          "임계 출처",          104),
     ("otsu_threshold_ref",        "Otsu(참고)",         84),
+    ("separability",              "밝기 분리도",        88),
+    ("dynamic_range",             "동적 범위",          80),
+    ("gray_levels",               "계조 수",            68),
 ]
 
 # ############################################################################
@@ -197,6 +204,44 @@ COL_HELP = {
         "설정하신 고정 임계값이 이 값과 크게 다르면, 밝기나 대비가 다른 이미지를 "
         "같은 고정 임계로 비교하고 있다는 신호입니다. 그럴 때는 '대비 정규화'를 "
         "켜시거나 'Otsu(일괄)'로 바꾸십시오.",
+
+    "threshold_source":
+        "'적용 임계' 값이 어디서 나온 것인지입니다.\n\n"
+        "• 고정 — 입력칸에 쓰신 값을 그대로 썼습니다.\n"
+        "• Otsu(이미지별) — 이 이미지의 밝기 분포에서 프로그램이 정했습니다.\n"
+        "• Otsu(일괄) — 불러온 이미지 전체에서 하나를 정해 모두에 같이 썼습니다.\n\n"
+        "'고정'이 아닌 행에서는 임계 입력칸의 숫자가 쓰이지 않습니다. 그래서 "
+        "Otsu 모드를 고르시면 입력칸이 회색으로 잠기고, 실제로 적용된 값은 "
+        "분석 조건 아래의 '적용 임계' 표시와 이 표에서 보여 드립니다.",
+
+    "separability":
+        "이 이미지가 정말 '어두운 쪽'과 '밝은 쪽' 두 무리로 갈라지는지를 0~1로 "
+        "나타낸 값입니다. Otsu가 고른 임계에서의 계급 간 분산 ÷ 전체 분산입니다.\n\n"
+        "왜 필요한가 — Otsu는 어떤 이미지를 줘도 임계값을 하나 내놓습니다. 기공이 "
+        "전혀 없는 시야를 줘도 노이즈를 둘로 갈라 개공율을 만들어냅니다. 합성 "
+        "시험에서 기공이 0개인 이미지가 5.0 %로 보고되었습니다. 그 상황을 "
+        "가려내는 것이 이 값입니다.\n\n"
+        "합성 이미지 기준: 실제 기공이 있으면 0.90~0.94이고, 대비를 1/16로 "
+        "압축해도 0.939 → 0.938로 거의 변하지 않았습니다(즉 대비를 다시 말하는 "
+        "값이 아닙니다). 기공이 없는 시야는 0.64, 정규화가 무너진 경우는 0.44였습니다.\n\n"
+        "0.70 미만이면 경고를 띄웁니다. 이 경계선은 합성 이미지에서만 확인한 "
+        "값이므로, 실제 SEM 이미지로 몇 장 보시고 조정하실 필요가 있습니다.",
+
+    "dynamic_range":
+        "정규화가 0과 1로 보내는 두 밝기 사이의 간격입니다(0~1 척도).\n\n"
+        "이 값이 작다는 것은 원본이 좁은 밝기 구간만 쓰고 있다는 뜻입니다. "
+        "정규화는 이것을 0~1로 늘려 펴서 밝기 차이를 상쇄합니다.\n\n"
+        "값 자체가 작은 것은 문제가 아닙니다. 합성 시험에서 동적 범위가 0.546에서 "
+        "0.031로 줄어도(약 1/16) 개공율은 7.68 % → 7.78 %로 유지되었습니다. "
+        "판단은 '계조 수'와 '밝기 분리도'로 하십시오.",
+
+    "gray_levels":
+        "정규화 구간 안에 실제로 존재하는 8비트 계조의 개수입니다.\n\n"
+        "이것이 진짜 한계입니다. 구간이 5단계뿐이면 아무리 늘려 펴도 임계값을 그 "
+        "5단계 사이에서만 고를 수 있어, 경계가 계단처럼 끊깁니다. 늘려 펴는 것은 "
+        "없는 정보를 만들지 못합니다.\n\n"
+        "12단계 미만이면 경고합니다. 그때는 설정을 바꾸는 것보다 대비를 높여 "
+        "재촬영하시는 편이 확실합니다.",
 }
 
 # ------------------------------------------------------------- 분석 조건 항목
@@ -217,7 +262,8 @@ PARAM_HELP = {
     "threshold":
         "정규화 밝기(0~1) 기준으로 이 값보다 어두운 픽셀을 개구부 후보로 봅니다.\n\n"
         "임계 모드가 '고정'일 때만 쓰입니다. Otsu 모드에서는 프로그램이 임계값을 "
-        "직접 고르므로 이 칸은 무시됩니다.\n\n"
+        "직접 고르므로 이 칸은 회색으로 잠기고, 실제로 적용되는 값은 바로 아래 "
+        "'적용 임계' 표시에 나옵니다.\n\n"
         "값 자체의 타당성은 결과 표의 'Otsu(참고)' 값과 대조해 보십시오.",
     "min_diam_um":
         "등가직경이 이 값보다 작은 덩어리는 버립니다. 유효 최소 스케일에 해당합니다.\n\n"
@@ -257,7 +303,22 @@ MODE_HELP = (
     "전부에 똑같이 적용합니다. 이미지 집합의 실제 밝기 범위에 맞추면서도 "
     "비교 대상 간에는 동일한 기준이 유지됩니다.\n\n"
     "두 조건을 비교하신다면 '대비 정규화 + Otsu(일괄)'을 권합니다. "
-    "'권장 설정' 버튼으로 한 번에 맞출 수 있습니다."
+    "'권장 설정' 버튼으로 한 번에 맞출 수 있습니다.\n\n"
+    "Otsu 두 모드에서는 위의 '이진화 임계' 입력칸이 쓰이지 않습니다. 그래서 "
+    "칸이 회색으로 잠기고, 실제로 적용되는 값은 아래 '적용 임계' 줄에 나옵니다."
+)
+
+# --------------------------------------------------- 적용 임계 표시 (조건 영역)
+APPLIED_HELP = (
+    "지금 설정으로 실제 적용되는(또는 적용된) 이진화 임계값입니다.\n\n"
+    "'고정'에서는 입력칸의 값이 그대로 나옵니다. Otsu 모드에서는 분석을 "
+    "실행해야 값이 정해지므로, 실행 전에는 무엇이 값을 정하는지만 알려 드리고 "
+    "실행 후에 실제 값을 채웁니다.\n\n"
+    "Otsu(일괄)에서는 모든 이미지가 같은 값 하나를 씁니다. "
+    "Otsu(이미지별)에서는 이미지마다 다르므로 최솟값~최댓값 범위로 보여 드리고, "
+    "이미지별 값은 결과 표의 '적용 임계' 열에서 확인하십시오.\n\n"
+    "두 조건을 비교하실 때는 이 값이 양쪽에서 같아야 합니다. 다르면 개공율 "
+    "차이에 임계값 차이가 섞입니다."
 )
 
 # ------------------------------------------------------------------ 체크박스
@@ -280,12 +341,32 @@ CHECK_HELP = {
         "삼기 때문에 기공이 많고 적음에는 거의 흔들리지 않습니다.\n\n"
         "합성 이미지 실험에서, 한쪽을 밝고 대비 낮게 찍은 경우 고정 임계만으로는 "
         "조건 간 비율이 2.25배에서 1.73배로 무너졌지만, 이 옵션을 켜면 2.22배로 "
-        "돌아왔습니다.",
+        "돌아왔습니다. 대비를 1/16로 압축한 이미지도 고정 임계로는 0 %가 나오지만 "
+        "이 옵션을 켜면 7.4 %로 정상 복원되었습니다.\n\n"
+        "대비가 아주 낮아도 늘려 펴는 배율을 제한하지는 않습니다. 실험 결과 "
+        "제한해서 얻는 것이 없었기 때문입니다(동적 범위 0.546 → 0.031에서도 "
+        "개공율 7.68 % → 7.78 % 유지).\n\n"
+        "주의할 조합이 하나 있습니다. 하위 기준(1 %)이 실제 암부 면적보다 크면, "
+        "그 백분위가 밝은 기지 안에 들어앉아 기지의 노이즈를 0~1로 늘려 펴고 "
+        "기공을 전부 0으로 눌러버립니다. 기공이 0.5 %뿐인 시야에서 참값 0.41 %가 "
+        "5.16 %로 나온 적이 있습니다. 그래서 프로그램이 먼저 암부 비율을 "
+        "어림하고, 필요하면 하위 기준을 자동으로 그 아래로 낮춘 뒤 무엇을 "
+        "낮췄는지 경고로 알려 드립니다.",
     "border":
         "이미지 경계에 닿은 Pore를 계산에서 제외합니다.\n\n"
         "잘린 객체는 둘레와 볼록 껍질이 실제와 달라 형상 지표를 신뢰할 수 없습니다. "
         "다만 큰 Pore일수록 경계에 닿기 쉬우므로, 제외하면 개공율은 과소평가됩니다. "
         "제외된 면적 비율은 결과 표의 '접촉면적 %'에서 확인하십시오.",
+    "paste":
+        "클립보드에 들어 있는 이미지를 바로 불러옵니다. Ctrl+V(맥은 ⌘V)도 "
+        "같습니다.\n\n"
+        "캡처 도구로 SEM 화면을 오려 붙이거나, 탐색기·Finder에서 파일을 복사해 "
+        "오셔도 됩니다. 붙여넣은 그림은 파일이 없으므로 임시 PNG로 저장해 "
+        "'클립보드_01' 같은 이름으로 목록에 넣습니다.\n\n"
+        "붙여넣은 이미지에는 메타데이터가 없어 픽셀 크기를 자동으로 읽을 수 "
+        "없습니다. '스케일바로 측정'을 쓰시거나 직접 입력하십시오. 또 임시 "
+        "파일이라 다음 실행 때는 스케일 저장값이 남지 않습니다. 반복해서 쓰실 "
+        "이미지는 파일로 저장해 두고 불러오시는 편이 낫습니다.",
     "autocrop":
         "이미지 위아래의 단색 띠를 자동으로 찾아 잘라냅니다.\n\n"
         "SEM 정보바와 화면 캡처의 검은 여백이 대상입니다. 거의 단색이면서 "
@@ -454,10 +535,25 @@ class App:
         self._preview_img = None
         self._q: queue.Queue = queue.Queue()
         self._busy = False
+        self._paste_dir = None
+        self._paste_seq = 0
         self.tip = Tooltip(root)
 
         self._build_style()
         self._build_widgets()
+        self._on_mode_change()
+        # Keep the "적용 임계" line honest while the number is being typed.
+        self.v["threshold"].trace_add(
+            "write", lambda *_: self._refresh_applied_threshold())
+
+        # Paste is bound on the toplevel, which fires AFTER the Entry class
+        # binding, so text paste into a parameter box still works; the handler
+        # checks where the focus is and steps aside when it is in an entry.
+        for seq in ("<Control-v>", "<Control-V>", "<Command-v>", "<Command-V>"):
+            try:
+                root.bind(seq, self._paste_from_clipboard)
+            except tk.TclError:
+                pass
 
         # Drag-and-drop is a convenience, never a requirement: tkinterdnd2 can
         # import while its tkdnd binaries fail to load in a frozen build, and a
@@ -490,6 +586,8 @@ class App:
         s.configure("Big.TLabel", font=("Segoe UI", 15, "bold"))
         s.configure("Legend.TLabel", font=("Segoe UI", 9))
         s.configure("Warn.TLabel", foreground="#b8860b", font=("Segoe UI", 9))
+        s.configure("Bad.TLabel", foreground="#c0392b", font=("Segoe UI", 9, "bold"))
+        s.configure("Applied.TLabel", foreground="#1a5fb4", font=("Segoe UI", 9, "bold"))
 
     def _build_widgets(self):
         outer = ttk.Frame(self.root, padding=8)
@@ -526,6 +624,10 @@ class App:
         fbtn = ttk.Frame(fbox)
         fbtn.pack(side="left", fill="y", padx=(8, 0))
         ttk.Button(fbtn, text="이미지 추가", command=self._browse).pack(fill="x", pady=2)
+        b_paste = ttk.Button(fbtn, text="붙여넣기 (Ctrl+V)",
+                             command=self._paste_from_clipboard)
+        b_paste.pack(fill="x", pady=2)
+        attach_tip(b_paste, self.tip, CHECK_HELP["paste"], key="btn:paste")
         ttk.Button(fbtn, text="선택 제거", command=self._remove_sel).pack(fill="x", pady=2)
         ttk.Button(fbtn, text="전체 비우기", command=self._clear).pack(fill="x", pady=2)
         b_px = ttk.Button(fbtn, text="픽셀 크기 지정…", command=self._edit_pixel_size)
@@ -565,6 +667,7 @@ class App:
             ("하단 크롭 (px)", "crop_bottom_px"),
         ]
         self.param_labels = {}
+        self.param_entries = {}
         for i, (label, key) in enumerate(rows):
             r, c = i % 4, i // 4
             lab = ttk.Label(pbox, text=label, cursor="question_arrow")
@@ -572,6 +675,7 @@ class App:
             lab.grid(row=r, column=c * 2, sticky="w", padx=(0, 6), pady=2)
             ent = ttk.Entry(pbox, textvariable=self.v[key], width=8)
             ent.grid(row=r, column=c * 2 + 1, pady=2)
+            self.param_entries[key] = ent
             help_text = PARAM_HELP.get(key, "")
             if help_text:
                 attach_tip(lab, self.tip, help_text, key=f"param:{key}")
@@ -600,6 +704,7 @@ class App:
         cmb = ttk.Combobox(mrow, textvariable=self.var_mode, state="readonly",
                            width=15, values=[m[0] for m in THRESHOLD_MODES])
         cmb.pack(side="left")
+        cmb.bind("<<ComboboxSelected>>", lambda e: self._on_mode_change())
         attach_tip(lab_mode, self.tip, MODE_HELP, key="mode")
         attach_tip(cmb, self.tip, MODE_HELP, key="mode")
 
@@ -626,17 +731,27 @@ class App:
                    "쓰셔야 합니다.",
                    key="btn:reco")
 
+        # What threshold is ACTUALLY in force. The entry box above is ignored in
+        # the Otsu modes, and without this line the only way to find that out was
+        # to run the analysis and read a column at the far right of the table.
+        trow = ttk.Frame(pbox)
+        trow.grid(row=6, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self.lbl_thr = ttk.Label(trow, text="", style="Applied.TLabel",
+                                 cursor="question_arrow")
+        self.lbl_thr.pack(side="left")
+        attach_tip(self.lbl_thr, self.tip, APPLIED_HELP, key="applied")
+
         self.var_border = tk.BooleanVar(value=True)
         self.var_autocrop = tk.BooleanVar(value=True)
         cb1 = ttk.Checkbutton(pbox, text="프레임 접촉 객체 제외", variable=self.var_border)
-        cb1.grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        cb1.grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
         cb2 = ttk.Checkbutton(pbox, text="위·아래 단색 띠 자동 크롭", variable=self.var_autocrop)
-        cb2.grid(row=6, column=2, columnspan=2, sticky="w", pady=(6, 0))
+        cb2.grid(row=7, column=2, columnspan=2, sticky="w", pady=(6, 0))
         attach_tip(cb1, self.tip, CHECK_HELP["border"], key="chk:border")
         attach_tip(cb2, self.tip, CHECK_HELP["autocrop"], key="chk:autocrop")
 
         abox = ttk.Frame(pbox)
-        abox.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        abox.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         self.btn_run = ttk.Button(abox, text="분석 실행", command=self._run)
         self.btn_run.pack(side="left")
         ttk.Button(abox, text="CSV 저장", command=self._save_csv).pack(side="left", padx=4)
@@ -654,6 +769,10 @@ class App:
         self.lbl_mixed = ttk.Label(outer, text="", style="Warn.TLabel",
                                    anchor="w", justify="left", wraplength=1250)
         self.lbl_mixed.pack(fill="x", pady=(6, 0))
+        # Separate label: a scale warning must not overwrite a quality warning.
+        self.lbl_warn = ttk.Label(outer, text="", style="Bad.TLabel",
+                                  anchor="w", justify="left", wraplength=1250)
+        self.lbl_warn.pack(fill="x")
 
         mid = ttk.Frame(outer)
         mid.pack(fill="both", expand=True, pady=(8, 0))
@@ -686,6 +805,7 @@ class App:
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._show_preview())
         self.tree.bind("<Motion>", self._on_tree_motion, add="+")
         self.tree.bind("<Leave>", self._on_tree_leave, add="+")
+        self.tree.tag_configure("flagged", background="#ffe7d1")
 
         vbox = ttk.LabelFrame(mid, text="분할 결과", padding=6)
         vbox.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
@@ -754,9 +874,57 @@ class App:
                 return key
         return "fixed"
 
+    def _on_mode_change(self):
+        """
+        Lock the threshold entry whenever it is not the thing being used.
+
+        A live entry box whose number is silently ignored is the whole bug: the
+        user set 0.45, the analysis ran at 0.58, and nothing on screen said so.
+        """
+        ent = self.param_entries.get("threshold")
+        fixed = self._mode_key() == "fixed"
+        if ent is not None:
+            ent.config(state="normal" if fixed else "disabled")
+        self._refresh_applied_threshold()
+
+    def _refresh_applied_threshold(self):
+        """Show the threshold in force: the typed one, or what the run chose."""
+        mode = self._mode_key()
+        thrs = [r.effective_threshold for r in self.results.values()
+                if r.effective_threshold == r.effective_threshold]
+        if mode == "fixed":
+            self.lbl_thr.config(
+                text=f"적용 임계  {self.v['threshold'].get()}  (입력하신 고정값)")
+            return
+        name = "Otsu(일괄) — 전체 공통 1개" if mode == "otsu_batch" \
+            else "Otsu(이미지별) — 이미지마다 다름"
+        if not thrs:
+            self.lbl_thr.config(
+                text=f"적용 임계  분석 실행 후 결정 · {name}"
+                     f"   (임계 입력칸 {self.v['threshold'].get()} 은 쓰이지 않습니다)")
+        elif max(thrs) - min(thrs) < 5e-5:
+            self.lbl_thr.config(text=f"적용 임계  {thrs[0]:.4f}  ·  {name}")
+        else:
+            self.lbl_thr.config(
+                text=f"적용 임계  {min(thrs):.4f} – {max(thrs):.4f}  ·  {name}")
+
+    def _refresh_quality_warnings(self):
+        """Surface per-image quality warnings as one line, not buried columns."""
+        flagged = [(p, r) for p, r in self.results.items() if r.warnings]
+        if not flagged:
+            self.lbl_warn.config(text="")
+            return
+        first = flagged[0][1]
+        head = f"주의 {len(flagged)}개 이미지: "
+        body = f"{first.source} — {first.warnings[0]}"
+        more = f"  (…외 {len(flagged) - 1}개, 표의 해당 행이 주황색입니다)" \
+            if len(flagged) > 1 else ""
+        self.lbl_warn.config(text=head + body + more)
+
     def _apply_recommended(self):
         self.var_normalize.set(True)
         self.var_mode.set("Otsu (일괄)")
+        self._on_mode_change()
         self.status.config(
             text="권장 설정 적용: 대비 정규화 + Otsu(일괄). "
                  "모든 이미지에 같은 임계값이 적용되며, 결과 표의 '적용 임계' 열에서 확인하실 수 있습니다.")
@@ -921,6 +1089,96 @@ class App:
             filetypes=[("이미지", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp"), ("모든 파일", "*.*")])
         self._add_files(paths)
 
+    # ------------------------------------------------------ clipboard paste
+    def _clipboard_dir(self) -> str:
+        """A temp folder for pasted bitmaps, removed when the program exits."""
+        if self._paste_dir is None:
+            self._paste_dir = tempfile.mkdtemp(prefix="cmp_pore_paste_")
+            atexit.register(shutil.rmtree, self._paste_dir, ignore_errors=True)
+        return self._paste_dir
+
+    def _save_pasted_image(self, img) -> str:
+        """
+        Put a clipboard bitmap on disk.
+
+        Everything downstream is path-based — the scale store, the unique
+        labels, the overlay filenames, the CSV — so a pasted image needs a file
+        to stand on rather than a special case threaded through all of it.
+        """
+        self._paste_seq += 1
+        path = os.path.join(self._clipboard_dir(),
+                            f"클립보드_{self._paste_seq:02d}.png")
+        if img.mode not in ("L", "RGB", "RGBA", "I", "I;16"):
+            img = img.convert("RGB")
+        img.save(path)
+        return path
+
+    def _paste_from_clipboard(self, event=None):
+        # Fired from the key binding while a parameter box has focus: Tk has
+        # already pasted the text there, so do nothing more.
+        if event is not None:
+            try:
+                w = self.root.focus_get()
+            except Exception:
+                w = None
+            if isinstance(w, (tk.Entry, ttk.Entry, ttk.Combobox, tk.Text)):
+                return None
+
+        try:
+            from PIL import ImageGrab
+            data = ImageGrab.grabclipboard()
+        except Exception as exc:
+            # No clipboard backend: Pillow needs xclip/wl-paste on Linux.
+            messagebox.showinfo(
+                "클립보드를 읽을 수 없습니다",
+                f"이 환경에서는 클립보드 이미지를 읽지 못했습니다.\n"
+                f"'이미지 추가' 버튼이나 끌어다 놓기를 이용해 주십시오.\n\n"
+                f"({type(exc).__name__}: {exc})")
+            return "break"
+
+        if isinstance(data, list):          # files copied in Explorer / Finder
+            paths = [str(x) for x in data]
+            before = len(self.files)
+            self._add_files(paths)
+            if len(self.files) == before:
+                messagebox.showinfo(
+                    "붙여넣을 이미지가 없습니다",
+                    "복사하신 항목에서 분석할 수 있는 이미지 파일을 찾지 "
+                    "못했습니다.\n지원 형식: PNG, JPG, TIF, BMP")
+            return "break"
+
+        if data is None:
+            # Some tools put a path on the clipboard as plain text instead.
+            try:
+                text = self.root.clipboard_get()
+            except Exception:
+                text = ""
+            cand = [ln.strip().strip('"') for ln in str(text).splitlines() if ln.strip()]
+            cand = [c for c in cand
+                    if c.lower().endswith(IMAGE_EXT) and os.path.isfile(c)]
+            if cand:
+                self._add_files(cand)
+                return "break"
+            messagebox.showinfo(
+                "클립보드가 비어 있습니다",
+                "클립보드에 이미지가 없습니다.\n\n"
+                "캡처 도구로 영역을 복사하시거나, 탐색기에서 이미지 파일을 "
+                "복사한 뒤 다시 시도하십시오.")
+            return "break"
+
+        try:
+            path = self._save_pasted_image(data)
+        except Exception as exc:
+            messagebox.showerror("붙여넣기 실패",
+                                 f"클립보드 이미지를 저장하지 못했습니다.\n"
+                                 f"{type(exc).__name__}: {exc}")
+            return "break"
+        self._add_files([path])
+        self.status.config(
+            text=f"클립보드에서 1개 추가 — {os.path.basename(path)} "
+                 f"(픽셀 크기는 메타데이터가 없어 직접 지정하셔야 합니다)")
+        return "break"
+
     def _on_drop(self, event):
         try:
             paths = self.root.tk.splitlist(event.data)
@@ -967,7 +1225,9 @@ class App:
         self.lbl_big.config(text="유효 Pore 개공율 —")
         self.lbl_sub.config(text="")
         self.lbl_mixed.config(text="")
+        self.lbl_warn.config(text="")
         self.lbl_px_src.config(text="")
+        self._refresh_applied_threshold()
 
     # ------------------------------------------------------------ params
     def _params(self) -> Params:
@@ -1214,7 +1474,10 @@ class App:
                 continue
             row = res.summary_row()
             self.tree.insert("", "end", iid=path,
-                             values=[row.get(c[0], "") for c in COLUMNS])
+                             values=[row.get(c[0], "") for c in COLUMNS],
+                             tags=("flagged",) if res.warnings else ())
+        self._refresh_applied_threshold()
+        self._refresh_quality_warnings()
 
     def _selected_path(self):
         sel = self.tree.selection()
@@ -1255,11 +1518,17 @@ class App:
 
         mode_note = ""
         if used is not None:
-            label = {"fixed": "고정", "otsu": "Otsu(이미지별)",
-                     "otsu_batch": "Otsu(일괄)"}.get(used.threshold_mode, used.threshold_mode)
             norm = " · 대비 정규화" if used.normalize_contrast else ""
             mode_note = (f"임계 {res.effective_threshold:.4f} "
-                         f"({label}{norm}) · 이 이미지의 Otsu {res.otsu_threshold:.3f}\n")
+                         f"({res.threshold_source}{norm}) · "
+                         f"이 이미지의 Otsu {res.otsu_threshold:.3f}\n"
+                         f"밝기 분리도 {res.separability:.3f} · "
+                         f"동적 범위 {res.dynamic_range:.3f} · "
+                         f"계조 {res.gray_levels}단계\n")
+
+        warn_note = ""
+        if res.warnings:
+            warn_note = "\n⚠ " + "\n⚠ ".join(res.warnings)
 
         self.lbl_big.config(text=f"유효 Pore 개공율 {100*res.open_pore_fraction:.2f} %")
         self.lbl_sub.config(text=(
@@ -1276,7 +1545,8 @@ class App:
             f"Pore 면적(필터전) {100*res.dark_area_fraction:.1f} % · "
             f"Non-Pore 면적 {100*(1-res.dark_area_fraction):.1f} %\n"
             f"프레임 접촉 제외 {res.n_rejected_border}개 "
-            f"(면적 {100*res.border_area_fraction:.1f} %) — 개공율은 그만큼 과소평가"))
+            f"(면적 {100*res.border_area_fraction:.1f} %) — 개공율은 그만큼 과소평가"
+            f"{warn_note}"))
 
     # -------------------------------------------------------------- save
     def _save_csv(self):

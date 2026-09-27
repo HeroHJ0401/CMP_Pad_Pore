@@ -26,7 +26,8 @@ from PIL import Image
 
 __all__ = ["Params", "Result", "analyze_path", "analyze_array",
            "robustness_sweep", "detect_bands", "load_gray",
-           "prepare", "pooled_otsu", "unique_labels"]
+           "prepare", "pooled_otsu", "unique_labels",
+           "normalization_window", "contrast_report", "otsu_separability"]
 
 
 # --------------------------------------------------------------------------
@@ -57,6 +58,14 @@ class Params:
     threshold_mode: str = "fixed"
     norm_low_pct: float = 1.0         # percentile mapped to 0 when normalizing
     norm_high_pct: float = 99.0       # percentile mapped to 1 when normalizing
+
+    # Otsu returns a threshold whatever it is given, including a field with no
+    # pores in it. `separability` (Otsu's eta) says whether two brightness
+    # classes were really there; below this the reading is flagged rather than
+    # reported as if it were sound. 0.70 sits in the gap measured on synthetic
+    # images (0.90-0.94 genuine / 0.44-0.64 degenerate) and is deliberately on
+    # the permissive side, since only synthetic evidence stands behind it.
+    min_separability: float = 0.70
 
     # Smoothing and opening are pixel operations, so at two magnifications the
     # same pixel count is a different physical size. Setting these in µm keeps
@@ -119,9 +128,15 @@ class Result:
 
     otsu_threshold: float = float("nan")    # this image's own Otsu value
     effective_threshold: float = float("nan")  # what was actually applied
+    threshold_source: str = ""              # 고정 / Otsu(이미지별) / Otsu(일괄)
+    separability: float = float("nan")      # Otsu eta on the prepared image
+    dynamic_range: float = float("nan")     # width of the normalization window
+    gray_levels: int = 0                    # 8-bit levels inside that window
+    norm_low_pct_used: float = float("nan")
     pixel_size_um: float = float("nan")     # the scale used for THIS image
     sigma_px_used: float = float("nan")
     opening_px_used: int = 0
+    warnings: list = field(default_factory=list)
 
     # heavy payloads (not written to CSV)
     objects: list = field(default_factory=list, repr=False)
@@ -159,7 +174,12 @@ class Result:
             "n_rejected_border": self.n_rejected_border,
             "border_area_fraction_pct": round(100 * self.border_area_fraction, 2),
             "effective_threshold": _r(self.effective_threshold, 4),
+            "threshold_source": self.threshold_source,
             "otsu_threshold_ref": _r(self.otsu_threshold, 3),
+            "separability": _r(self.separability, 3),
+            "dynamic_range": _r(self.dynamic_range, 3),
+            "gray_levels": self.gray_levels,
+            "warning": " / ".join(self.warnings),
             "sigma_px_used": _r(self.sigma_px_used, 3),
             "sigma_um_used": _r(self.sigma_px_used * self.pixel_size_um, 4),
             "opening_px_used": self.opening_px_used,
@@ -279,18 +299,149 @@ def detect_info_bar(gray: np.ndarray) -> int:
 # Core analysis
 # --------------------------------------------------------------------------
 
+def _minority_fraction(gray: np.ndarray) -> float:
+    """
+    Rough share of the image taken by the darker of its two brightness classes,
+    from a plain Otsu split of the raw pixels. Used only to keep the
+    normalization anchors out of the majority population — never as a result.
+    """
+    try:
+        t = float(filters.threshold_otsu(gray))
+    except Exception:
+        return float("nan")
+    return float((gray < t).mean())
+
+
+def normalization_window(gray: np.ndarray, p: Params) -> tuple:
+    """
+    The two grey levels that normalization maps to 0 and 1, plus the
+    percentiles actually used: (lo, hi, lo_pct, hi_pct).
+
+    The anchors must sit OUTSIDE the two populations, not inside one of them.
+    With the default lower anchor at 1 % and a field whose pores cover only
+    0.5 %, the 1st percentile lands in the bright matrix: the stretch then
+    spreads matrix noise across the whole range and clips every pore together
+    at 0. Otsu duly splits the noise and the reading came out at 5.16 % against
+    a true 0.41 % — an order of magnitude, silently.
+
+    So each anchor is held below half the population on its own side, estimated
+    from a plain Otsu split of the raw image. For an ordinary field (pores ~9 %)
+    the estimate is far above 1 % and nothing moves; it only bites when the
+    anchor would otherwise have fallen inside a population.
+    """
+    lo_pct = max(0.0, float(p.norm_low_pct))
+    hi_pct = min(100.0, float(p.norm_high_pct))
+    dark = _minority_fraction(gray)
+    if np.isfinite(dark) and 0.0 < dark < 1.0:
+        lo_pct = min(lo_pct, 100.0 * dark / 2.0)
+        hi_pct = max(hi_pct, 100.0 - 100.0 * (1.0 - dark) / 2.0)
+    lo, hi = np.percentile(gray, [lo_pct, hi_pct])
+    return float(lo), float(hi), lo_pct, hi_pct
+
+
 def prepare(gray: np.ndarray, p: Params) -> np.ndarray:
     """Normalize (optionally) and smooth — everything before the threshold."""
     g = gray
     if p.normalize_contrast:
-        lo, hi = np.percentile(g, [p.norm_low_pct, p.norm_high_pct])
+        lo, hi, _, _ = normalization_window(g, p)
         if hi > lo:
             g = np.clip((g - lo) / (hi - lo), 0.0, 1.0)
     sigma = p.resolved_sigma_px()
     return ndi.gaussian_filter(g, sigma=sigma) if sigma > 0 else g
 
 
-def pooled_otsu(grays, p: Params, max_px_per_image: int = 400_000) -> float:
+def contrast_report(gray: np.ndarray, p: Params) -> dict:
+    """
+    How much brightness information this image actually carries, measured on
+    the raw pixels before normalization.
+
+      dynamic_range    hi - lo of the normalization window, in 0-1 grey units.
+      gray_levels      distinct 8-bit levels inside that window. This is the
+                       one that sets a floor on what any threshold can resolve:
+                       a window 5 levels wide cannot be split finely, however
+                       far it is stretched afterwards.
+      norm_low_pct     the lower anchor actually used (see normalization_window).
+    """
+    lo, hi, lo_pct, hi_pct = normalization_window(gray, p)
+    inside = gray[(gray >= lo) & (gray <= hi)]
+    levels = int(np.unique(np.round(inside * 255.0)).size) if inside.size else 0
+    return {
+        "dynamic_range": float(hi - lo),
+        "gray_levels": levels,
+        "norm_low_pct": float(lo_pct),
+        "norm_high_pct": float(hi_pct),
+    }
+
+
+def otsu_separability(sm: np.ndarray, nbins: int = 1024) -> float:
+    """
+    Otsu's own separability measure eta = between-class variance at the chosen
+    threshold / total variance, on the already-prepared image. 1 means two
+    perfectly separated brightness classes, 0 means one indivisible blob.
+
+    This is the honest answer to "is a threshold meaningful on this image at
+    all". Otsu always returns a threshold, even for a field with no pores in
+    it: on synthetic no-pore images it split the noise and reported ~5 % open
+    pore area out of nothing. eta is what tells those apart — measured 0.90-0.94
+    for genuine pores at any contrast (0.939 at full contrast, 0.938 after
+    compressing it 16x, so it does not merely restate contrast), against 0.64
+    for a pore-free field and 0.44 where normalization had collapsed.
+    """
+    sm = np.asarray(sm).ravel()
+    if sm.size == 0:
+        return float("nan")
+    edges = np.linspace(0.0, 1.0, int(nbins) + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    counts, _ = np.histogram(sm, bins=edges)
+    pr = counts.astype(np.float64)
+    total = pr.sum()
+    if total <= 0:
+        return float("nan")
+    pr /= total
+    mu = float((pr * centers).sum())
+    var_total = float((pr * (centers - mu) ** 2).sum())
+    if var_total <= 0:
+        return 0.0
+    w1 = np.cumsum(pr)
+    w2 = np.cumsum(pr[::-1])[::-1]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        m1 = np.cumsum(pr * centers) / w1
+        m2 = (np.cumsum((pr * centers)[::-1]) / w2[::-1])[::-1]
+        vb = w1[:-1] * w2[1:] * (m1[:-1] - m2[1:]) ** 2
+    vb = np.nan_to_num(vb, nan=-1.0, posinf=-1.0, neginf=-1.0)
+    best = float(vb.max())
+    if best <= 0:
+        return 0.0
+    return float(min(1.0, best / var_total))
+
+
+POOLED_NBINS = 4096         # bin resolution of the pooled histogram: 1/4096
+
+
+def _otsu_from_hist(counts: np.ndarray, centers: np.ndarray) -> float:
+    """
+    Otsu's threshold from a histogram, using scikit-image's own convention:
+    class 0 is bins 0..i, class 1 is bins i+1.., and the returned value is
+    centers[argmax]. Implemented here rather than calling
+    filters.threshold_otsu(hist=...) so the result cannot drift with the
+    scikit-image version bundled into a frozen build.
+    """
+    counts = np.asarray(counts, dtype=np.float64)
+    if counts.sum() <= 0 or counts.size < 2:
+        return float("nan")
+    w1 = np.cumsum(counts)
+    w2 = np.cumsum(counts[::-1])[::-1]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        m1 = np.cumsum(counts * centers) / w1
+        m2 = (np.cumsum((counts * centers)[::-1]) / w2[::-1])[::-1]
+        var = w1[:-1] * w2[1:] * (m1[:-1] - m2[1:]) ** 2
+    var = np.nan_to_num(var, nan=-1.0, posinf=-1.0, neginf=-1.0)
+    if not np.any(var > 0):
+        return float("nan")
+    return float(centers[int(np.argmax(var))])
+
+
+def pooled_otsu(grays, p: Params, nbins: int = POOLED_NBINS) -> float:
     """
     One Otsu threshold computed from several images at once.
 
@@ -299,21 +450,37 @@ def pooled_otsu(grays, p: Params, max_px_per_image: int = 400_000) -> float:
     different threshold, so part of the difference under test is absorbed. A
     threshold pooled over the images being compared adapts to the set's actual
     greyscale range while staying identical for every image in it.
+
+    Every pixel of every image is counted, through an accumulated histogram on
+    a FIXED grid over [0, 1]. Two properties follow, and both are the point:
+
+      * The result does not depend on the order the images arrive in. The
+        earlier version drew a random subsample per image from one shared
+        Generator, so the draw for image k depended on how many images came
+        before it — reordering the same files moved the threshold, and with it
+        the reported numbers. Measured on synthetic sets: 0.5 % of the value
+        when the histogram was cleanly bimodal, 5.9 % when it was nearly
+        unimodal, because a shallow Otsu optimum amplifies any perturbation.
+      * Every image carries the same weight regardless of its pixel count,
+        since each histogram is divided by its own pixel total. Otherwise a
+        2048x1536 field would outvote a 1024x768 one four to one in setting a
+        threshold that is then applied to both.
     """
-    samples = []
-    rng = np.random.default_rng(0)
+    nbins = max(2, int(nbins))
+    edges = np.linspace(0.0, 1.0, nbins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    hist = np.zeros(nbins, dtype=np.float64)
+    n_img = 0
     for g in grays:
         sm = prepare(g, p).ravel()
-        if sm.size > max_px_per_image:            # subsample big images
-            sm = rng.choice(sm, max_px_per_image, replace=False)
-        samples.append(sm)
-    if not samples:
+        if sm.size == 0:
+            continue
+        counts, _ = np.histogram(sm, bins=edges)
+        hist += counts / float(sm.size)       # equal weight per image
+        n_img += 1
+    if n_img == 0:
         return float("nan")
-    pool = np.concatenate(samples)
-    try:
-        return float(filters.threshold_otsu(pool))
-    except Exception:
-        return float("nan")
+    return _otsu_from_hist(hist, centers)
 
 
 def analyze_array(gray: np.ndarray, p: Params, source: str = "",
@@ -334,8 +501,15 @@ def analyze_array(gray: np.ndarray, p: Params, source: str = "",
     res.sigma_px_used = p.resolved_sigma_px()
     res.opening_px_used = p.resolved_opening_px()
 
+    # ---- how much brightness information is actually here ---------------
+    rep = contrast_report(gray, p)
+    res.dynamic_range = rep["dynamic_range"]
+    res.gray_levels = rep["gray_levels"]
+    res.norm_low_pct_used = rep["norm_low_pct"]
+
     # ---- normalize + smooth --------------------------------------------
     sm = prepare(gray, p)
+    res.separability = otsu_separability(sm)
 
     # ---- threshold -----------------------------------------------------
     try:
@@ -345,13 +519,33 @@ def analyze_array(gray: np.ndarray, p: Params, source: str = "",
 
     if forced_threshold is not None:
         thr = float(forced_threshold)
+        res.threshold_source = "Otsu(일괄)"
     elif p.threshold_mode == "otsu":
         thr = res.otsu_threshold
+        res.threshold_source = "Otsu(이미지별)"
     else:                                  # "fixed", and "otsu_batch" without
         thr = p.threshold                  # a pooled value supplied
+        res.threshold_source = "고정"
     if not np.isfinite(thr):
         thr = p.threshold
+        res.threshold_source = "고정(대체)"
     res.effective_threshold = float(thr)
+
+    # ---- warnings the user must see, not bury in a column ---------------
+    if np.isfinite(res.separability) and res.separability < p.min_separability:
+        res.warnings.append(
+            f"밝기 분리도 {res.separability:.2f} (<{p.min_separability:.2f}) — "
+            "두 계급으로 갈라지지 않는 이미지입니다. 임계값이 사실상 임의로 "
+            "정해지므로 이 행의 개공율은 신뢰하지 마십시오.")
+    if res.gray_levels and res.gray_levels < 12:
+        res.warnings.append(
+            f"정규화 구간의 계조가 {res.gray_levels}단계뿐입니다 — "
+            "대비를 높여 재촬영하시는 편이 낫습니다.")
+    if (p.normalize_contrast and np.isfinite(res.norm_low_pct_used)
+            and res.norm_low_pct_used < p.norm_low_pct - 1e-9):
+        res.warnings.append(
+            f"암부 면적이 좁아 정규화 하위 기준을 {p.norm_low_pct:.2f} % 대신 "
+            f"{res.norm_low_pct_used:.2f} %로 낮춰 적용했습니다.")
 
     binary = sm < thr                     # dark = candidate opening
     res.dark_area_fraction = float(binary.mean())

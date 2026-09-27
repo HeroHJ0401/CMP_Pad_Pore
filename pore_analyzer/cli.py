@@ -143,9 +143,11 @@ def main(argv=None):
         print(f"  Pore 수        {res.n_objects}  (밀도 {res.object_density_per_mm2:.0f} /mm²)")
         print(f"  픽셀 크기      {p.pixel_size_um:.5g} µm/px")
         print(f"  적용 임계      {res.effective_threshold:.4f}  "
-              f"(모드 {p.threshold_mode}"
+              f"(출처 {res.threshold_source}"
               f"{', 대비 정규화' if p.normalize_contrast else ''}"
               f", 이 이미지의 Otsu {res.otsu_threshold:.3f})")
+        print(f"  밝기 분리도    {res.separability:.3f}  "
+              f"(동적 범위 {res.dynamic_range:.3f}, 계조 {res.gray_levels}단계)")
         print(f"  유효 Pore 개공율 {100*res.open_pore_fraction:.2f} %   <-- 주 지표")
         print(f"  Pore 개공율    {100*res.total_pore_fraction:.2f} % "
               f"(= 유효 {100*res.open_pore_fraction:.2f} + "
@@ -161,6 +163,8 @@ def main(argv=None):
         print(f"  등가직경 중앙값 {res.eqdiam_median_um:.2f} µm")
         print(f"  제외: 소형 {res.n_rejected_small}, 프레임접촉 {res.n_rejected_border} "
               f"(면적 {100*res.border_area_fraction:.1f} %)")
+        for w in res.warnings:
+            print(f"  [주의] {w}")
 
         if args.overlay_dir:
             # Name from the disambiguated label, or two folders holding the
